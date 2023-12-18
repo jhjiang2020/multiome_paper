@@ -1,0 +1,204 @@
+---
+title: "Pseudobulk analysis of MP scRNA-seq data ox-LDL vs Buffer"
+output: html_notebook
+---
+
+# Load packages
+```{r}
+## DE test
+library(Seurat)
+library(dplyr)
+library(edgeR)
+
+## plot
+library(ggplot2)
+library(ggrepel)
+
+## PCA
+library("FactoMineR")
+library("factoextra")
+
+## GO-enrichment
+library(topGO)
+library(org.Hs.eg.db) 
+```
+# Load Seurat object
+```{r}
+data_dir <- "~/Oxford/Results/scRNA/pseudobulk/"
+```
+
+```{r}
+MP <- readRDS(paste0(data_dir, "MP_scRNA_filtered_Jan20.rds"))
+
+# Aggregate by sample
+counts <- AggregateExpression(
+  MP,
+  assays = "RNA",
+  return.seurat = FALSE,
+  group.by = "orig.ident",
+  add.ident = NULL,
+  slot = "data",
+  verbose = TRUE
+)
+
+```
+
+# DE analysis by edgeR
+```{r}
+y <- DGEList(counts=counts[[1]])
+group <- colnames(counts[[1]])
+y$samples$group <- group
+```
+
+## normalize reads - CPM
+```{r}
+#calculate count per million before filtering and normalization
+cpm <- cpm(y)
+lcpm <- cpm(y, log=TRUE)
+
+L <- mean(y$samples$lib.size) * 1e-6 #mean library sizes
+M <- median(y$samples$lib.size) * 1e-6 #median library sizes
+c(L, M) 
+```
+
+## filter out lowly expressed genes
+```{r}
+#filtering wth edgeR package
+keep.exprs <- filterByExpr(y, group=group, min.count=30) #filtering based on group, keeping the gene with a cpm >(10/M+2/L) in at least Min sample (Min is the minimum # of reps of each group; the default minimum count is min.count=10) 
+y_filtered <- y[keep.exprs,, keep.lib.sizes=FALSE]
+lcpm.cutoff <- log2(50/M + 2/L) # 10/median + 2/mean is the default cutoff line
+nrow(y_filtered)
+```
+
+## calculate normalization factor using edgeR's TMM method
+```{r}
+#using calcNormFactors in edgeR
+
+y_filtered_norm <- calcNormFactors(y_filtered, method = "TMM")
+y_filtered_norm$samples$norm.factors
+```
+
+## PCA plot to check data quality
+```{r}
+data <- t(cpm(y_filtered_norm, log=T))
+data = apply(data,c(1,2),as.numeric)
+data.pca <- PCA(data[],scale.unit = F, graph = F)
+
+fviz_eig(data.pca, addlabels = TRUE, ylim = c(0, 100))
+
+treatment <- rep(c("Buffer", "oxLDL"), c(4,4))
+donor <- rep(paste("Donor", 1:4, sep="_"),2) 
+fviz_pca_ind(data.pca,
+             geom.ind = c("point","text"), # show points only (or "text")
+             #col.ind = treatment, 
+             col.ind = donor,
+             #addEllipses = F, # Concentration ellipses
+             legend.title = c("Donor"),
+             axes = c(1,2) #chose dimensions to be plotted
+) 
+```
+## DE test - Quasi-likelihood test
+```{r}
+design <- model.matrix(~donor+treatment)
+rownames(design)<- colnames(y)
+
+#estimate dispersion
+y_filtered_norm <- estimateDisp(y_filtered_norm,design, robust = TRUE)
+plotBCV(y_filtered_norm)
+```
+```{r}
+# QL
+fit <- glmQLFit(y_filtered_norm, design) #control type I error: QL methods are better; cases involving low counts and/or large dispersions: the LRT is better.
+
+#QLF test
+qlf <- glmQLFTest(fit)
+
+o <- order(qlf$table$PValue)
+cpm(y_filtered_norm)[o[1:5],]
+summary(decideTests(qlf))
+
+write.csv(qlf$table %>% tibble::rownames_to_column(var = "gene"), paste0(data_dir, "Pseudobulk_OvsB.csv"), row.names = F)
+```
+
+# Volcano plot
+```{r}
+de.results <- read.csv(paste0(data_dir, "Pseudobulk_OvsB.csv")) %>% 
+  mutate(flag = ifelse(P_adj < 0.05, sign(logFC), 0) %>% as.factor()) 
+
+de.results %>% 
+  mutate(logP_adj = -log10(P_adj)) %>% 
+  ggplot(aes(x=logFC, y = logP_adj, color =flag)) + 
+  geom_point() + 
+  geom_text_repel(data = . %>%
+                    mutate(label = ifelse(logP_adj > 3 & abs(logFC)>2.3, gene, "")),
+                  aes(label = label), color = "black",
+                  box.padding = 0.6,
+                  show.legend = FALSE) + 
+  xlab( "log2FC") + ylab("-log10FDR") + 
+  xlim(c(-6,6)) +
+  scale_color_manual(values = c("-1"="#0099CC","1" = "#FF6666", "0" = "grey50"),
+                    labels = c("Buffer", "oxLDL", "not DE")) + 
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(legend.title = element_blank())
+
+```
+# GO-BP enrichment
+
+```{r}
+get_topGOData <- function(x){
+  geneList <- x$PValue %>% as.numeric()
+  names(geneList) <- x$gene
+  GOdata <- new("topGOdata",
+  	ontology = "BP",
+  	allGenes = geneList,
+  	geneSelectionFun = function(x)x,
+  	annot = annFUN.org , mapping = "org.Hs.eg.db", ID = "symbol")
+  return(GOdata)
+}
+
+GOdata_up <- get_topGOData(de.results  %>% filter(logFC>0))
+GOdata_down <- get_topGOData(de.results %>% filter(logFC<0))
+
+result_up <- runTest(GOdata_up, algorithm = "weight01", statistic = "ks")
+result_down <- runTest(GOdata_down, algorithm = "weight01", statistic = "ks")
+
+data.frame(ID = names(result_up@score) , p_val = result_up@score) %>% 
+  filter(p_val < 0.05) %>% 
+  write.table(file=paste0(data_dir, "GO_pseudobulk_UP.txt"), row.names = F, col.names = F, quote = F)
+data.frame(ID = names(result_down@score) , p_val = result_down@score) %>% 
+  filter(p_val < 0.05) %>% 
+  write.table(file=paste0(data_dir, "GO_pseudobulk_DOWN.txt"), row.names = F, col.names = F, quote = F)
+```
+
+## GO Enrichment using XGR
+```{r}
+library(XGR)
+```
+
+
+```{r}
+genes.up <- de.results %>% dplyr::filter(P_adj<0.05 & logFC > 0 ) %>% pull(gene)
+genes.down <- de.results %>% dplyr::filter(P_adj<0.05 & logFC < 0 ) %>% pull(gene)
+
+RData.location <- "http://galahad.well.ox.ac.uk/bigdata"
+# ?xDefineOntology
+
+enrich.up <- xEnricherGenes(data = genes.up,RData.location = RData.location, ontology="MsigdbC2KEGG") 
+enrich.down <- xEnricherGenes(data = genes.down, RData.location = RData.location, ontology="MsigdbC2KEGG") 
+# p1 <- xEnrichBarplot(enrich.up)
+# p2 <- xEnrichBarplot(enrich.down)
+
+enrich.up.df <- data.frame("pathway" = enrich.up$term_info$name, "FDR" = enrich.up$adjp, "mlogFDR" = -log10(enrich.up$adjp), 
+                           "FC" = enrich.up$fc, "n_overlaps" = lapply(enrich.up$overlap, length) %>% unlist)
+
+
+enrich.down.df <- data.frame("pathway" = enrich.down$term_info$name, "FDR" = enrich.down$adjp, "mlogFDR" = -log10(enrich.down$adjp), 
+                             "FC" = enrich.down$fc, "n_overlaps" = lapply(enrich.down$overlap, length) %>% unlist)
+
+# enrich.down.df$pathway <- enrich.down.df$pathway %>% gsub(pattern = "Ensemble of genes encoding ", replacement = "") %>% 
+#     gsub(pattern = "Genes encoding ", replacement = "") %>% 
+#     stringr::str_to_sentence()
+
+saveRDS(list("up" = enrich.up.df, "down" = enrich.down.df), file = paste0(data_dir, "XGR_enrichment_KEGG.rds"))
+```
+

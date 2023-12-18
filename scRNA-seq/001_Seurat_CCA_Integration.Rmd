@@ -1,0 +1,207 @@
+---
+title: "scRNA-seq analysis of ex vivo macrophages"
+output: html_notebook
+---
+
+# Load packages
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+options(Seurat.object.assay.version = "v3")
+```
+# Load and format datasets
+```{r}
+data_dir <- "~/Oxford/Results/scRNA/"
+```
+
+```{r}
+dir_10x <- list.dirs(path = paste0(data_dir, "Counts/"), full.names = T, recursive = F) %>%
+  paste0("/outs/filtered_feature_bc_matrix/")
+
+data <- lapply(dir_10x, Read10X)
+names(data) <- list.dirs(path = paste0(data_dir, "Counts/"), full.names = F, recursive = F)
+
+MP.list <- lapply(data, CreateSeuratObject)
+
+## annotate seurat objects 
+id <- c(paste("buffer", 1:4, sep = "_"), paste("oxldl", 1:4, sep = "_") )
+for( i in 1:8){
+  MP.list[[i]]@meta.data$orig.ident <- id[i]
+}
+```
+
+# Data integration using the Seurat's CCA pipeline and SCTransform
+
+## scTransfrom
+
+```{r}
+## score cell cycle genes
+MP.list <- lapply(MP.list, CellCycleScoring, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = F)
+
+MP.list <- lapply(MP.list, FUN = function(object){
+  object$CC.Difference <- object$S.Score - object$G2M.Score
+  return(object)
+})
+
+```
+```{r}
+#regress out cell cycle differences and MT%
+
+MP.list <- lapply(MP.list, PercentageFeatureSet, pattern = "^MT-", col.name = "percent.mt")
+## filter out cells with mt% higher than 20%
+MP.list <- lapply(MP.list, subset, subset=(percent.mt <= 20))
+
+MP.list <- lapply(MP.list, SCTransform, assay = "RNA", verbose=F, vars.to.regress = c("CC.Difference", "percent.mt"), variable.features.n = 3000)
+```
+
+## CCA integration
+```{r }
+features <- SelectIntegrationFeatures(object.list = MP.list, nfeatures = 3000)
+MP.list <- PrepSCTIntegration(object.list = MP.list, anchor.features = features)
+
+anchors <- FindIntegrationAnchors(object.list = MP.list, 
+                                  normalization.method = "SCT", anchor.features = features,
+                                  dims = 1:30, reduction = "cca", k.anchor = 5)
+
+MP <- IntegrateData(anchorset = anchors, normalization.method = "SCT", new.assay.name = "integrated", k.weight=100, dims = 1:30)
+```
+
+
+# Clustering parameters optimization - stability test
+```{r }
+DefaultAssay(MP) <- "integrated"
+MP <- RunPCA(MP, verbose = FALSE)
+ElbowPlot(MP, ndims = 40)
+```
+## Optimizing clustering parameters with scclusteval
+```{r}
+subsample_idents<- readRDS(paste0(data_dir, "/scclusteval/gather_subsample.rds"))
+
+fullsample_idents<- readRDS(paste0(data_dir, "/scclusteval/gather_full_sample.rds"))
+```
+```{r}
+## how many clusters for each different comibination of parameter set?
+fullsample_idents %>%
+  mutate(cluster_num = purrr::map_dbl(original_ident_full, ~length(unique(.x)))) %>% 
+  mutate(id=row_number()) %>% 
+  select(id, pc, resolution, k_param, cluster_num)
+```
+
+## assign stable clusters based on n=50 of sub-sampling
+```{r}
+subsample_idents_list<- subsample_idents %>%
+  group_by(pc, resolution, k_param) %>%
+  nest()
+
+stable_clusters<- subsample_idents_list %>%
+  mutate(stable_cluster = map(data, ~ scclusteval::AssignStableCluster(.x$original_ident,
+                                                          .x$recluster_ident,
+                                                          jaccard_cutoff = 0.8,
+                                                          method = "jaccard_percent",
+                                                          percent_cutoff = 0.8)))
+
+```
+## get the parameter sets with 100% of cells in stable clusters
+```{r}
+n_stable_clusters <- stable_clusters$stable_cluster %>% lapply(FUN=function(x){return(x$number_of_stable_cluster)}) %>% unlist
+
+df <- fullsample_idents %>%
+  mutate(cluster_num = purrr::map_dbl(original_ident_full, ~length(unique(.x)))) %>% 
+  mutate(id=row_number()) %>% 
+  select(id, pc, resolution, k_param, cluster_num)
+df <- df[df$cluster_num==n_stable_clusters,]
+
+df
+```
+
+
+```{r}
+p1 <- scclusteval::ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                        fullsample_idents = fullsample_idents,
+                        x_var = "k_param",
+                        y_var = "number",
+                        facet_rows = "resolution",
+                        facet_cols = "pc") + 
+   ggtitle("the number of  clusters identified")
+
+p2 <- scclusteval::ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                        fullsample_idents = fullsample_idents,
+                        x_var = "k_param",
+                        y_var = "percentage",
+                        facet_rows = "resolution",
+                        facet_cols = "pc") +
+  ggtitle("percentage of cells in stable clusters")
+```
+
+# Clustering n_PCs = 25, k.param=40, resolution=0.4
+
+```{r}
+MP <- RunUMAP(MP, reduction = "pca", dims = 1:25)
+```
+```{r}
+MP <- FindNeighbors(MP, reduction = "pca", dims = 1:25, k.param = 40)
+MP <- FindClusters(MP, resolution = 0.4)
+```
+```{r}
+MP$RNA_clusters <- MP$seurat_clusters
+
+DimPlot(MP, reduction = "umap", group.by = "RNA_clusters", label = T, repel = T)
+```
+
+
+## Visualization by donor and by treatment
+```{r}
+MP$batch <- MP$orig.ident
+MP$treatment <- MP$orig.ident %>% 
+  gsub(pattern="^([a-z]+)_[1-4]", replacement="\\1")
+MP$donor <- paste0("donor_",  gsub(x = MP$orig.ident, pattern="^[a-z]+_([1-4])", replacement="\\1") )
+```
+
+```{r}
+p1 <- DimPlot(MP, reduction = "umap", group.by = "treatment")
+
+p2 <- DimPlot(MP, reduction = "umap", group.by = "donor")
+p1 + p2
+```
+
+## Annotation
+
+### Wilcoxon test
+```{r}
+Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
+source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+
+
+DefaultAssay(MP) <- "RNA"
+## log1p normalize the data
+MP <- NormalizeData(MP)
+markers <- wilcoxauc(MP, group_by = "RNA_clusters")
+```
+
+```{r}
+markers %>% filter(logFC>0) %>% group_by(group) %>% top_n(n=5, wt=-padj)
+```
+```{r}
+MP$subtype <- plyr::revalue(MP$RNA_clusters, c("0" = "FUCA1hi MΦ-1",
+                                               "1" = "PCSK6hi MΦ",
+                                               "2" = "MHChi MΦ",
+                                               "3" = "Lipid-handling MΦ",
+                                               "4" = "Cycling MΦ-1",
+                                               "5" = "Cycling MΦ-2",
+                                               "6" = "Damaged cells (excluded)",
+                                               "7" = "T-cells (excluded)",
+                                               "8" = "M1-like MΦ"))
+```
+
+```{r}
+saveRDS(MP, paste0(data_dir,"MP.Nov2023.rds"))
+```
+
+```{r}
+MP_oxldl <- readRDS(paste0(data_dir,"MP.Nov2023.rds")) %>% 
+  subset(RNA_clusters %in% c(0:5,8))
+```
+

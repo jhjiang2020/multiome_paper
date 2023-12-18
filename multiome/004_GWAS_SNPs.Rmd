@@ -1,0 +1,121 @@
+---
+title: "Use macrophage CRE to prioritize causal CAD variants"
+output: html_notebook
+---
+
+## Load packages
+```{r load packages}
+library(dplyr)
+library(Seurat)
+library(GenomicRanges)
+library(Signac)
+library(ggplot2)
+## Load functions
+source("../../functions/GWAS_functions.R")
+```
+
+## Get CAD-associated SNPs
+```{r}
+# MAKE SURE PLINK & bcftools ARE INSTALLED
+bcftools="bcftools"
+plink = "plink"
+
+# load gwas catalog
+gwas.hg38 <- format_GWAS_SNP("/well/ocallaghan/users/qhs307/raw_data/GWAS_catalog/gwasCatalog.txt.gz", p_value_threshold = 5e-8)
+
+## Manual filtering
+gwas.hg38.cad <- filter_GWAS_SNP(formatted.gwas = gwas.hg38, filter = "Coronary artery disease")
+
+
+## set the marker column as the new ID (CHR:POS)
+colnames(gwas.hg38.cad) <- c("rsid", "SNP", "P", "trait")
+
+## Prune SNPs to get independent loci (r2<0.1)
+genotypeData = "/well/ocallaghan/users/qhs307/reference_genome/hg38_1000G/EUR/EUR_posid_hg38"
+gwas.hg38.pruned <- prune_GWAS_SNP(gwas.hg38.cad, plink = plink, genotypeData = genotypeData, r2=0.1)
+
+## get highLD SNPs within each locus (r2>0.8 with the index SNP)
+gwas.hg38.finalist <- getld_GWAS_SNP(gwas.hg38.pruned, plink = plink, genotypeData = genotypeData, r2 = 0.8, return_clump=F)
+
+
+
+## Get rsids with bcftools query
+vcf = "/well/ocallaghan/users/qhs307/raw_data/dbSNP/dbSNP.common.hg38.vcf.gz"
+
+
+gwas.hg38.finalist <- pos2rsid(gwas.hg38.finalist, bcftools=bcftools, vcf=vcf)
+
+
+saveRDS(gwas.hg38.finalist, "./CAD_associated_SNPs.hg38.rds")
+```
+
+## Permutation-based enrichment test 
+```{r}
+## Load background peakset
+bg <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/bgPeaks.rds")
+```
+
+### CREs and ox-LDL CREs
+```{r}
+# load CREs
+# cres <- Links(MP_multiome)
+cres <- readRDS("~/Oxford/Code/R/multiome/003_Downstream_GWAS/linked_peaks_df.rds")
+
+# we define oxLDL-induced genes as the union of ox-LDL-induced DEGs in each cluster
+oxLDL_induced.genes <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP.DE.genes.all_nov9.rds") %>% 
+  lapply(FUN = filter, p_val_adj < 0.05) %>% 
+  lapply(FUN = tibble::rownames_to_column, var = "gene" ) %>%
+  bind_rows %>% 
+  pull(gene) %>% unique() 
+
+oxldl.cres <- filter(cres, gene %in% oxLDL_induced.genes)
+```
+
+```{r}
+enr.cres <- GWASPeakZtest(peakSet = cres$peak %>% unique(), weights = NULL,
+              bgPeaks = bg, SNPSet = gwas.hg38.finalist, n_bgs = 1000, return_bg = T)
+
+plot_enrichment(enr.cres)
+```
+
+```{r}
+enr.oxcres <- GWASPeakZtest(peakSet = oxldl.cres$peak %>% unique(), weights = NULL,
+              bgPeaks = bg, SNPSet = gwas.hg38.finalist, n_bgs = 1000, return_bg = T)
+plot_enrichment(enr.oxcres)
+```
+```{r}
+saveRDS(list("ALL" = enr.cres,
+             "OX" = enr.oxcres), file="./Ztest_all&oxldl_CREs.rds")
+```
+
+### ABC-enhancers
+```{r}
+ABC_links_mono.gr <- readRDS( "~/Oxford/Results/multiome/rdata/ABC_links_mono.rds")
+
+## get the ABC_enhancer-overlapping peaks and their targeting genes
+All_peaks <- rownames(bg) %>% StringToGRanges()
+o <-findOverlaps(ABC_links_mono.gr, All_peaks)
+ABC_mono_peaks <- All_peaks[subjectHits(o),] %>% as.data.frame() %>% 
+  mutate(peak = paste(seqnames, start, end, sep="-"))
+ABC_mono_peaks$gene <- ABC_links_mono.gr[queryHits(o),]$TargetGene
+
+ABC_mono_peaks <- distinct(ABC_mono_peaks)
+
+
+enr.ABC <- GWASPeakZtest(peakSet = ABC_mono_peaks$peak %>% unique(),
+              bgPeaks = bg, SNPSet = gwas.hg38.finalist, n_bgs = 1000, return_bg = T)
+
+plot_enrichment(enr.ABC)
+```
+```{r}
+ABC_mono_peaks.oxldl <- filter(ABC_mono_peaks, gene %in% oxLDL_induced.genes)
+enr.ox_ABC <- GWASPeakZtest(peakSet = ABC_mono_peaks.oxldl$peak %>% unique(),
+              bgPeaks = bg, SNPSet = CAD.hg38.finalist, n_bgs = 1000, return_bg  = T)
+
+plot_enrichment(enr.ox_ABC)
+```
+```{r}
+saveRDS(list("ALL" = enr.ABC,
+             "OX" = enr.ox_ABC), file = "./ABC_mononuclear_enhancers.rds")
+```
+

@@ -1,0 +1,180 @@
+---
+title: "Cluster stability test for LAMs"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(patchwork)
+```
+
+# Re-clustering of Lipid-associated macrophages (LAM) 
+
+
+```{r}
+data_dir <- "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/"
+
+MP_Plaque <- readRDS(paste0(data_dir, "/rdata/MP_Plaque.Nov2023.filtered.rds"))
+LAM <- subset(MP_Plaque, subtype=="Lipid-associated MΦ")
+DefaultAssay(LAM) <- "integrated"
+LAM <- RunPCA(LAM, verbose = FALSE)
+saveRDS(LAM, paste0(data_dir, "/rdata/LAM_plaque.Nov2023.rds"))
+```
+
+```{r}
+LAM <- readRDS(paste0(data_dir, "/rdata/LAM_plaque.Nov2023.rds"))
+DefaultAssay(LAM) <- "integrated"
+ElbowPlot(LAM, ndims = 40)
+```
+
+
+## Optimizing clustering parameters with scclusteval
+```{r}
+subsample_idents<- readRDS(paste0(data_dir, "/scclusteval/gather_subsample.rds"))
+
+fullsample_idents<- readRDS(paste0(data_dir, "/scclusteval/gather_full_sample.rds"))
+```
+```{r}
+## how many clusters for each different comibination of parameter set?
+fullsample_idents %>%
+  mutate(cluster_num = purrr::map_dbl(original_ident_full, ~length(unique(.x)))) %>% 
+  mutate(id=row_number()) %>% 
+  select(id, pc, resolution, k_param, cluster_num)
+```
+## assign stable clusters based on n=50 of sub-sampling
+```{r}
+subsample_idents_list<- subsample_idents %>%
+  group_by(pc, resolution, k_param) %>%
+  nest()
+
+stable_clusters<- subsample_idents_list %>%
+  mutate(stable_cluster = map(data, ~ scclusteval::AssignStableCluster(.x$original_ident,
+                                                          .x$recluster_ident,
+                                                          jaccard_cutoff = 0.8,
+                                                          method = "jaccard_percent",
+                                                          percent_cutoff = 0.75)))
+
+```
+## get the parameter sets with 100% of cells in stable clusters
+```{r}
+n_stable_clusters <- stable_clusters$stable_cluster %>% lapply(FUN=function(x){return(x$number_of_stable_cluster)}) %>% unlist
+
+df <- fullsample_idents %>%
+  mutate(cluster_num = purrr::map_dbl(original_ident_full, ~length(unique(.x)))) %>% 
+  mutate(id=row_number()) %>% 
+  select(id, pc, resolution, k_param, cluster_num)
+df <- df[df$cluster_num==n_stable_clusters,]
+
+df
+```
+
+```{r}
+p1 <- scclusteval::ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                        fullsample_idents = fullsample_idents,
+                        x_var = "k_param",
+                        y_var = "number",
+                        facet_rows = "resolution",
+                        facet_cols = "pc") + 
+   ggtitle("the number of  clusters identified")
+
+p2 <- scclusteval::ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                        fullsample_idents = fullsample_idents,
+                        x_var = "k_param",
+                        y_var = "percentage",
+                        facet_rows = "resolution",
+                        facet_cols = "pc") +
+  ggtitle("percentage of cells in stable clusters")
+```
+
+```{r}
+p3<- scclusteval::JaccardRainCloudPlot(subsample_idents_list$data[[33]]$original_ident,
+                          subsample_idents_list$data[[33]]$recluster_ident) + 
+        geom_hline(yintercept = c(0.8), linetype = 2) +
+        xlab("cluster id (n_PC=10, res=0.3, k=40)") + 
+        ylab("Jaccard Index") + 
+        ylim(c(0,1.05))
+
+
+p4 <- scclusteval::PairWiseJaccardSetsHeatmap(fullsample_idents$original_ident_full[[33]],
+                           fullsample_idents$original_ident_full[[41]],
+                           show_row_dend = F, show_column_dend = F,
+                           cluster_row = F, cluster_column =F)
+```
+
+
+## Run the clustering with k=40, res=0.3, n_PC=10
+
+```{r}
+LAM <- RunUMAP(LAM, assay = "RNA", reduction = "pca", dims = 1:10, reduction.name = 'umap.lam', reduction.key = 'lamUMAP_')
+
+LAM <- FindNeighbors(LAM, reduction = "pca", dims = 1:10, k.param = 20)  
+
+LAM <- FindClusters(LAM, resolution = 0.3)
+LAM$RNA_clusters <- LAM$seurat_clusters
+DimPlot(LAM, reduction = "umap.lam", group.by = "RNA_clusters", label = T, repel = T) 
+```
+```{r}
+saveRDS(LAM, file = "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/rdata/LAM_plaque.Nov2023.rds")
+```
+
+```{r}
+Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
+source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+DefaultAssay(LAM) <- "RNA"
+markers <- wilcoxauc(LAM, group_by = "seurat_clusters")
+```
+
+
+```{r}
+LAM_markers = c("CD52", "APOC1","PPARG","LPL","CHI3L1",  # CD52+ LAM,
+                "HLA-DPB1","B2M","HLA-DMA", "HLA-A","FUCA1", # MHC class IIhi
+                "LYVE1", "FCGBP", "COLEC12","F13A1","LILRB5",  #resting
+               "CDKN3","MKI67", "TK1", "TOP2A","CDK1" # cycling
+              )
+DotPlot(LAM,  assay = "RNA",features = LAM_markers,cluster.idents = T,
+                 scale.by = "radius") + 
+  ggtitle("Plaque LAM") + 
+  guides(size = guide_legend(override.aes = list(fill="black"), title = "Percent Expressed", title.position="top"),
+           color = guide_colorbar(frame.colour = "black", ticks.colour = "black", frame.linewidth = 1, nrow=1,title = "Average Expression", title.position="top")) + 
+  scale_y_discrete(limits=rev,
+                   label = c("0" = expression(paste("CD52"^"hi", " LAM")),
+                             "1" = expression(paste("Resting", " LAM")),
+                             "2" = expression(paste("MHC"^"hi", " LAM")),
+                             "3" = expression(paste("Cycling", " LAM"))
+                               ))+
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+      legend.direction = "vertical",
+      axis.title = element_blank()
+    ) + 
+  scale_color_gradient2(limits = c(-2.5,2.5), low = '#3361A5', high =  '#A31D1D', 
+                        mid = 'grey95', midpoint=0) &
+    scale_size_continuous(limits = c(0,100), range = c(0,5)) 
+```
+```{r}
+LAM$subtype <-  plyr::revalue(LAM$seurat_clusters, replace= c("0" = "CD52-hi LAM",
+                                                             "1" = "Resting LAM",
+                                                             "2" = "MHC-hi LAM",
+                                                             "3" = "Cycling LAM"))
+```
+
+```{r}
+saveRDS(LAM, paste0(data_dir, "/rdata/LAM_plaque.Nov2023.rds"))
+```
+
+```{r}
+DefaultAssay(LAM) <- "RNA"
+FeaturePlot(LAM, reduction = "umap.lam", features = c("CD52","CHI3L1", "LPL", "PPARG", "CD36", "FDX1"), slot = "data") &
+  scale_color_gradientn(colors=c("grey95", BuenColors::jdb_palette("solar_rojos", type="continuous")), labels = c("Min", "Max"), breaks=c(0,5),
+                        guide = guide_colorbar(frame.linewidth = 0.5, frame.colour = "black")) &
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0) & 
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        legend.title = element_blank(),
+        legend.text.align = 0) 
+```

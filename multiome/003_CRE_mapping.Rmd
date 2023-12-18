@@ -1,0 +1,476 @@
+---
+title: "CRE and DORC analysis"
+output: html_notebook
+---
+# Load packages
+```{r}
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggpmisc)
+library(htmltools)
+```
+
+```{r}
+MP_multiome <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP_multiome_Mar7.rds")
+```
+
+# Load functions 
+```{r}
+source("./modified_figR_functions.R")
+```
+
+# Find CREs (gene-peak links)
+For each gene, we can find the set of peaks that may regulate the gene by by computing the correlation between gene expression and accessibility at nearby peaks, and correcting for bias due to GC content, overall accessibility, and peak size. 
+
+## Link peaks to genes
+```{r}
+DefaultAssay(MP_multiome) <- "peaks"
+
+# first compute the GC content for each peak
+MP_multiome <- RegionStats(MP_multiome, genome = BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38)
+
+# link peaks to genes (~2h)
+MP_multiome <- LinkPeaks(
+  object = MP_multiome,
+  peak.assay = "peaks",
+  expression.assay = "RNA", 
+  verbose = TRUE,
+  distance = 500000
+)
+```
+## Annotate CREs using ChIPseeker
+```{r }
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
+annot <- ChIPseeker::annotatePeak(Links(MP_multiome) %>% 
+                        as.data.frame %>% 
+                        dplyr::select(peak) %>% 
+                        unlist %>% 
+                        StringToGRanges, 
+                      tssRegion=c(-3000, 3000),TxDb=txdb, annoDb="org.Hs.eg.db")
+plotAnnoPie(annot)
+```
+
+# DORC analysis
+## Rank genes based on # of CREs (DORC)
+```{r}
+DefaultAssay(MP_multiome) <- "peaks"
+df_CREs <- Links(MP_multiome) %>% as.data.frame
+dorcJplot(linkTab = df_CREs, cutoff = 9, labelTop = 20, labelSize = 2)
+```
+
+## Calculating DORC scores (aggregated accessibility for CREs of individual DORC genes)
+
+```{r}
+dorcGenes <- dorcJplot(linkTab = df_CREs, cutoff = 9,returnGeneList = T)
+dg.list <- split(dorcGenes, f=seq(length(dorcGenes)))
+
+MP_multiome[["dorcScores"]] <- Calculate_DORC_scores(dg.list, link.df = df_CREs, peak_matrix = GetAssayData(MP_multiome, assay = "peaks", slot = "data"))
+
+## log-normalized
+DefaultAssay(MP_multiome) <- "dorcScores"
+MP_multiome <- NormalizeData(MP_multiome, assay = "dorcScores", scale.factor = 10000)
+```
+
+## Correlation between Gene expression and DORC scores
+```{r}
+Idents(MP_multiome) <- "treatment"
+
+DefaultAssay(MP_multiome) <- "dorcScores"
+
+DE.bulk.dorc <- FindMarkers(MP_multiome, ident.1 = "oxldl", ident.2 = "buffer",
+                                min.pct = 0.1, logfc.threshold=0, test.use = "LR",
+                                latent.vars = "percent.mt")
+
+DefaultAssay(MP_multiome) <- "RNA"
+DE.bulk.sn <- FindMarkers(MP_multiome, ident.1 = "oxldl", ident.2 = "buffer",
+                                min.pct = 0.1, logfc.threshold=0, test.use = "LR",
+                                latent.vars = "percent.mt")
+
+select <- intersect(DE.bulk.dorc %>% rownames(),
+                    DE.bulk.sn %>% rownames())
+
+df <- data.frame(dorc_lfc = DE.bulk.dorc[select, "avg_log2FC"],
+                 sn_lfc = DE.bulk.sn[select, "avg_log2FC"])
+rownames(df) <- select
+
+p <- ggplot(df, aes(x = dorc_lfc, y = sn_lfc)) +
+  geom_point() + 
+  geom_smooth(method = "lm", linetype="dashed", formula = y ~ x) + 
+  stat_correlation(method = "pearson", aes(label = paste(after_stat(r.label),
+                                                  after_stat(p.value.label),
+                                                  after_stat(n.label),
+                                                  sep = "*\"; \"*"))) +  
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") + 
+  xlab("Average log2FC (DORC Scores)") +
+  ylab("Average log2FC (snRNA-seq)") +
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) 
+p
+```
+```{r}
+top10 <- DE.bulk.dorc %>% 
+  tibble::rownames_to_column("gene") %>% 
+  mutate(flag = sign(avg_log2FC)) %>% 
+  group_by(flag) %>%
+  top_n(n = 10, wt = abs(avg_log2FC)) %>%
+  arrange(flag) %>% 
+  pull(gene)
+
+DefaultAssay(MP_multiome) <- "dorcScores"
+p1 <- DoHeatmap(MP_multiome %>% ScaleData(features = top10) , features = top10, assay = "dorcScores", slot = "scale.data", group.by = "treatment",group.colors = c("#0099CC","#FF6666")) + ggtitle("DORC Score") #& scale_fill_gradient2(low = scales::muted("blue"),mid = "white",  high = scales::muted("red"),  midpoint = 0,  na.value = "grey50")
+
+DefaultAssay(MP_multiome) <- "RNA"
+p2 <- DoHeatmap(MP_multiome %>% ScaleData(features = top10) , features = top10, assay = "RNA", slot = "scale.data", group.by = "treatment",group.colors = c("#0099CC","#FF6666")) + ggtitle("Gene Expression") #&scale_fill_gradient2(low = scales::muted("blue"),mid = "white",  high = scales::muted("red"),  midpoint = 0,  na.value = "grey50")
+
+p1+p2
+```
+
+# Transcriptional regulatory network (TRN) analysis
+## smooth DORC by nearest neighbors
+### obtain KNN from scATAC lsi or wnn
+```{r}
+dorcMat <- GetAssayData(MP_multiome, assay = "dorcScores", slot = "data")
+
+# Extract K nearest neighbors from wsnn/wknn (the number of neighbors stored in wknn is different)
+wsnn <- MP_multiome[['wsnn']]
+
+get_knn_row <- function(x, k){
+  x <- as.numeric(x)
+  return(doBy::which.maxn(x, n=k))
+}
+
+wknn <- apply(wsnn, MARGIN = 1, FUN = get_knn_row, k=20) %>% t
+stopifnot(all(rownames(wknn)==rownames(wsnn)))
+```
+### Smooth DORC scores with k=20 WNN/LSI neighbors
+```{r}
+library(doParallel)
+library(Matrix)
+library(SummarizedExperiment)
+library(Biostrings)
+dorcMat.smoothed <- smoothScoresNN(wknn,dorcMat,nCores = 6)
+#stopifnot(all.equal(rownames(dorcMat.smoothed),dorcGenes))
+
+```
+
+## smooth TF expression by nearest neighbors
+### TF RNA expression smooth
+```{r}
+# Load TF motif (https://github.com/buenrostrolab/stimATAC_analyses_code/blob/master/data/cisBP_human_pfms_2021.rds)
+human_pwms_v3 <- readRDS("./cisBP_human_pfms_2021.rds")
+if(all(grepl("_",names(human_pwms_v3),fixed = TRUE))){
+  names(human_pwms_v3) <- extractTFNames(names(human_pwms_v3))
+}
+TFOI <- intersect(rownames(MP_multiome@assays$RNA),names(human_pwms_v3))
+
+# Run smoothNN only on TFs to save time
+rnaMat.smoothed <- smoothScoresNN(NNmat = wknn,
+                                  TSSmat = GetAssayData(MP_multiome, assay = "RNA", slot = "data"),
+                                  nCores = 6,
+                                  geneList = TFOI)
+ 
+```
+## FigR pipeline
+### Convertion to SummarizedExperiment object
+```{r}
+ATAC.sce <- as.SingleCellExperiment(MP_multiome, assay = "peaks")
+counts <- SummarizedExperiment::assay(ATAC.sce, "counts")
+rowRanges <- rownames(ATAC.sce) %>% StringToGRanges
+
+## chromVAR deviation Z-score calculation requires raw counts
+ATAC.se <- SummarizedExperiment(assays = list(counts=counts), 
+                                rowRanges = rowRanges,
+                                colData = colData(ATAC.sce))
+```
+
+### Run figR
+```{r}
+source("./utils.R", local = T)
+mp_FigR <- runFigR.2(ATAC.se = ATAC.se,
+                           dorcK = 30,
+                           dorcTab = links.df,
+                           genome = "hg38",
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = 6)
+```
+
+
+### save the output file
+```{r}
+write.csv(mp_FigR, file="./figR_results.csv")
+```
+
+## Visualization
+
+### pheatmap
+```{r}
+# rows are DORC genes and cols are TF, values represent the combined enrichment score
+DORC_TF_matrix_all <- mp_FigR %>% 
+  tidyr::pivot_wider(id_cols = DORC, names_from = Motif, values_from = Score, values_fill = 0, values_fn = as.numeric) %>%
+  tibble::column_to_rownames(var="DORC") %>% 
+  as.matrix
+saveRDS(DORC_TF_matrix_all, "~/Oxford/Results/multiome/rdata/DORC_TF_matrix.rds")
+```
+
+```{r}
+col_select <- (matrixStats::colMaxs(DORC_TF_matrix_all) %>% abs ) >= 2
+row_select <- (matrixStats::rowMaxs(DORC_TF_matrix_all) %>% abs ) >= 2
+
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+DORC_TF_matrix <- DORC_TF_matrix_all[row_select, col_select]
+
+range <- max(abs(DORC_TF_matrix))
+
+CAD_genes <- read.csv("~/Oxford/Results/multiome/multiome_share/003_CAD_GWAS/archive/CAD_overlapping_links(CREs)_annotated.csv") %>% select(CRE_gene) %>% unique %>% unlist
+
+CAD_annot <- data.frame(CAD = ifelse(rownames(DORC_TF_matrix) %in% CAD_genes, yes = "yes", no = "no"))
+rownames(CAD_annot) <- rownames(DORC_TF_matrix)
+CAD_color <- list(CAD = c("yes" = "red", "no"="gray50"))
+
+pheatmap::pheatmap(t(DORC_TF_matrix), color = my_palette, scale = "none", main = "Heatmap of DORC regulation scores for all significant TF-DORC enrichments", 
+                   angle_col = 90,
+                   annotation_col = CAD_annot,
+                   annotation_colors = CAD_color,
+                   #kmeans_k = 50, 
+                   breaks = seq(-range, range, length.out = 100))
+
+```
+
+### Network visualization for CAD-related DORCs
+```{r}
+## get CAD DORCs
+CAD_genes <- read.csv("./Prioritized_CAD_risk_variants.csv") %>% pull(CRE_gene) %>% unique
+CAD_DORC <- intersect(CAD_genes, mp_FigR$DORC)
+
+CAD_TF <- intersect(CAD_genes, mp_FigR$Motif)
+
+cat("# of CAD-DORCs: ",length(CAD_DORC), "\n# of CAD-TFs: ",length(CAD_TF))
+
+p <- browsable(
+  tagList(
+    tags$head(
+      tags$style('
+        body{background-color: #FFFFFF !important}
+        .nodetext{fill: #000000}
+        .nodetext{opacity: 1}
+        .nodetext{dominant-baseline: central}
+        .nodetext{text-anchor: middle}
+        
+        
+        #.legend text{fill: #FF0000}
+      ')
+    ),
+    plotfigRNetwork(mp_FigR, score.cut = 1.5, DORCs = CAD_DORC, charge = -40)
+  )
+)
+
+
+p2 <- browsable(
+  tagList(
+    tags$head(
+      tags$style('
+        body{background-color: #FFFFFF !important}
+        .nodetext{fill: #000000}
+        .nodetext{opacity: 1}
+        .nodetext{dominant-baseline: central}
+        .nodetext{text-anchor: middle}
+        #.legend text{fill: #FF0000}
+      ')
+    ),
+    plotfigRNetwork(mp_FigR, score.cut = 1.5, TFs = "MITF", charge = -100)
+  )
+)
+
+```
+
+# Integrative analysis with H3K27ac ChIP-seq 
+```{r}
+## Load CRE peaks
+DefaultAssay(MP_multiome) <- "peaks"
+cres <- Links(MP_multiome)$peaks %>% unique %>% StringToGRanges()
+
+## Load background peakset
+all_peaks <- rownames(MP_multiome) %>% rownames %>% StringToGRanges
+non_cres <- GenomicRanges::setdiff(x = all_peaks, y = cres)
+```
+
+## resize all peaks (CREs and non-CREs) (BMRC)
+```{r}
+ext_bp = 2000 # extend in each direction
+bin_size = 100 # split each peaks into 100 bins to count H3K27ac signals
+n_bins = ceiling((ext_bp*2+1)/bin_size)
+
+cres_ext <- resize(cres, 1+2*ext_bp, fix="center") %>% 
+  tile(n = n_bins) 
+names(cres_ext) <- paste0("cre_",1:length(cres_ext) )
+cres_ext <- unlist(cres_ext)
+names(cres_ext) <- paste0(names(cres_ext), "_bin",1:n_bins)
+
+
+non_cres_ext <- resize(non_cres, 1+2*ext_bp, fix="center") %>% 
+  tile( width = bin_size)
+names(non_cres_ext) <- paste0("non_cre_",1:length(non_cres_ext) )
+non_cres_ext <- unlist(non_cres_ext)
+names(non_cres_ext) <- paste0(names(non_cres_ext), "_bin",1:n_bins)
+```
+
+## use Featurecount (BMRC)
+```{r}
+rtracklayer::export(cres_ext, "./cres_ext.gtf")
+buffer_cres <- featureCounts(files="../Bam/merged/HB.merge.bam", nthreads = 3, isPairedEnd = TRUE,  
+                           annot.ext = "./cres_ext.gtf", isGTFAnnotationFile = TRUE,
+                           GTF.featureType = "sequence_feature",GTF.attrType = "ID", allowMultiOverlap = FALSE )
+oxldl_cres <- featureCounts(files="../Bam/merged/HO.merge.bam", nthreads = 3, isPairedEnd = TRUE,  
+                           annot.ext = "./cres_ext.gtf", isGTFAnnotationFile = TRUE,
+                           GTF.featureType = "sequence_feature",GTF.attrType = "ID", allowMultiOverlap = FALSE )
+  
+
+rtracklayer::export(non_cres_ext, "./non_cres_ext.gtf")
+buffer_noncres <- featureCounts(files="../Bam/merged/HB.merge.bam", nthreads = 3, isPairedEnd = TRUE,  
+                           annot.ext = "./non_cres_ext.gtf", isGTFAnnotationFile = TRUE,
+                           GTF.featureType = "sequence_feature",GTF.attrType = "ID", allowMultiOverlap = FALSE )
+oxldl_noncres <- featureCounts(files="../Bam/merged/HO.merge.bam", nthreads = 3, isPairedEnd = TRUE,  
+                           annot.ext = "./non_cres_ext.gtf", isGTFAnnotationFile = TRUE,
+                           GTF.featureType = "sequence_feature",GTF.attrType = "ID", allowMultiOverlap = FALSE )
+
+save(buffer_cres, buffer_noncres, oxldl_cres, oxldl_noncres, file="./fc_h3k27ac.rdata")  
+ 
+```
+
+## Format fc count matrix and normalized by sequencing depth
+```{r}
+load(file="./fc_h3k27ac.rdata")  
+
+# Normalize signals by counts (cpm normalization)
+buffer_bam_counts <- 122739193/1e6
+oxldl_bam_counts <- 102734773/1e6
+
+## format count matrices
+format_fc_df <- function(fc, bin_size){
+  counts.df <- fc$counts %>% as.data.frame()
+  colnames(counts.df) <- "counts"
+  rows <- rownames(counts.df)
+  counts.df$cre <- gsub(x = rows, pattern = "(cre_\\d+).+$", replacement = "\\1")
+  counts.df$bin <- gsub(x = rows, pattern = ".+bin(\\d+)$", replacement = "\\1") %>% as.numeric
+  n_bins <- counts.df$bin %>% unique %>% length
+  counts.df$dis <- bin_size*(counts.df$bin - (1+n_bins)/2)
+  return(counts.df)
+}
+
+### buffer
+cres_b_df <- format_fc_df(buffer_cres, bin_size = bin_size)
+cres_b_df$group <- rep("CRE", dim(cres_b_df)[1])
+
+noncres_b_df <- format_fc_df(buffer_noncres, bin_size = bin_size)
+noncres_b_df$group <- rep("non-CRE", dim(noncres_b_df)[1])
+
+df_b <- rbind(cres_b_df, noncres_b_df)
+df_b$cpm <- df_b$counts/buffer_bam_counts
+df_b$treatment <- rep("buffer", dim(df_b)[1])
+
+### oxldl
+cres_o_df <- format_fc_df(oxldl_cres, bin_size = bin_size)
+cres_o_df$group <- rep("CRE", dim(cres_o_df)[1])
+
+noncres_o_df <- format_fc_df(oxldl_noncres, bin_size = bin_size)
+noncres_o_df$group <- rep("non-CRE", dim(noncres_o_df)[1])
+
+df_o <- rbind(cres_o_df, noncres_o_df)
+df_o$cpm <- df_o$counts/oxldl_bam_counts
+df_o$treatment <- rep("oxldl", dim(df_o)[1])
+
+df <- rbind(df_b, df_o)
+
+saveRDS(df, "./fc_h3k27ac_df.rds")
+```
+
+## GAM smoothing
+```{r}
+df <- df %>% filter(dis >= -1500 & dis <= 1500) %>% 
+  mutate(df, group_treatment = paste(group, treatment, sep="_"))
+p <- ggplot(df, aes(dis, cpm, color=group_treatment)) + stat_smooth(method = "gam")
+p2 <- ggplot_build(p)
+
+smooth <- p2$data[[1]]
+smooth$is_cre <- ifelse(smooth$group %in% c(1,2), yes = "Y", no = "N")
+smooth$H3K27ac <- ifelse(smooth$group %in% c(1,3), yes = "Buffer", no = "oxLDL")
+
+saveRDS(smooth, file = "./gam_smooth.rds")
+```
+
+# CRE enrichment test for functional annotations
+## Generate background peaks using chromVAR
+```{r}
+cres <- Links(MP_multiome)
+
+counts <- GetAssayData(MP.integrated, assay = "peaks", slot = "counts")
+
+ATAC.se <- SummarizedExperiment::SummarizedExperiment(assays = list(counts = counts),
+                                                      rowRanges = rownames(counts) %>% StringToGRanges )
+if(any(Matrix::rowSums(assay(ATAC.se))==0)){
+  ## chromVAR requires pre-filtering of zero-count peaks in the input se object
+  ## for simplicity, add 1 "fake cell" that contains all peaks so that zero-count peaks (in this case 2 peaks) have fragments
+  ATAC.se <- SummarizedExperiment(assays = list(counts=assay(ATAC.se) %>% cbind(1)),
+                                  rowRanges = rowRanges(ATAC.se))
+}
+ATAC.se <- chromVAR::addGCBias(ATAC.se, genome = BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38)
+set.seed(1998)
+bg <- chromVAR::getBackgroundPeaks(object = ATAC.se, niterations=1000)
+rownames(bg) <- rownames(ATAC.se)
+
+saveRDS(bg, "~/Oxford/Results/multiome/multiome_share/rdata/bgPeaks.rds")
+```
+
+## eQTL
+Whole blood eQTL SNPs were downloaded from GTEx v8 and eQTL gene and manually lifted over to hg38
+```{r}
+eqtl.df <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/annot/eqtl.df.hg38.rds")
+
+results.eqtl <- GWASPeakZtest(peakSet = cres$peak %>% unique(),
+              bgPeaks = bg, SNPSet = eqtl.df$Pos_hg38 %>% unique() %>% StringToGRanges(), n_bgs = 500, return_bg = T)
+
+plot_enrichment(results.eqtl, binwidth = 80)
+```
+
+## ABC-enhancer
+ABC-enhancers from 38 mononuclear phagocytes samples were retrieved from [https://www.engreitzlab.org/resources] and lifted over to hg38
+```{r}
+ABC_links_mono.gr <- readRDS("~/Oxford/Results/multiome/rdata/ABC_links_mono.rds")
+
+results.abc <- MarkPeakZtest(peakSet = cres$peak %>% unique(),
+              bgPeaks = bg,  MarkSet = ABC_links_mono.gr %>% reduce(), n_bgs = 500, return_bg =T)
+
+plot_enrichment(results.abc, binwidth = 30)
+```
+
+## Promoter interacting elements (PCHi-C) PMID: 27863249
+```{r}
+ch <- "../../hg19ToHg38.over.chain"
+phic.gr.hg38<- read.table("~/Oxford/Results/multiome/TAD_definitions/PCHiC_peak_matrix_cutoff5.tsv", header = T) %>% 
+  filter(oeName != ".") %>%
+  filter(max(Mac0, Mac1, Mac2) >= 5) %>%
+  select(oeChr, oeStart, oeEnd, baitName) %>% 
+  mutate(oeChr = paste0("chr", oeChr)) %>% 
+  distinct() %>% 
+  makeGRangesFromDataFrame(keep.extra.columns=TRUE,
+                          ignore.strand=FALSE,
+                          seqinfo=NULL,
+                          seqnames.field=c("oeChr"),
+                          start.field="oeStart",
+                          end.field=c("oeEnd"),
+                          strand.field="strand",
+                          starts.in.df.are.0based=FALSE) %>% 
+  liftOver(chain = ch) %>% 
+  unlist()
+
+results.phic <- MarkPeakZtest(peakSet = cres$peak %>% unique(), 
+                              MarkSet = phic.gr.hg38 %>% reduce, bgPeaks = bg, n_bgs = 500, return_bg = T)
+plot_enrichment(results.phic, binwidth = 10)
+```
+

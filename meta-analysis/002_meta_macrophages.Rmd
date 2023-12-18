@@ -1,0 +1,393 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Construction of the macrophage atlas
+## Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+```
+
+
+```{r}
+data_dir <- "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/rdata/"
+```
+
+
+## Subset the macrophage population and split by batch
+```{r}
+# split the RNA measurements into two layers one for control cells, one for stimulated cells
+MP.list <- readRDS(paste0(data_dir, "Human_Plaque.Nov2023.rds")) %>% 
+  subset(cell_type == "Macrophage") %>% 
+  DietSeurat(assays = "RNA") %>% 
+  SplitObject(split.by = "batch")
+
+
+## this is to ensure that cells from each dataset will have at least k=30 nearest neighbors
+# select <- lapply(MP.list, ncol) >= 30
+# MP.list <- MP.list[select]
+select <- lapply(MP.list, ncol) >= 100
+MP.list <- MP.list[select]
+```
+
+## Run SCTransform with cc.difference as a latent variable
+```{r}
+## compute cell cycle scores for each cell 
+MP.list <- lapply(MP.list, CellCycleScoring, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = TRUE)
+MP.list <- lapply(MP.list, FUN = function(object){
+  object$CC.Difference <- object$S.Score - object$G2M.Score
+  return(object)
+})
+
+MP.list <- lapply(MP.list, SCTransform, assay = "RNA", verbose=F, vars.to.regress = c("CC.Difference", "percent.mt"), variable.features.n = 3000)
+```
+
+### Default CCA integration with SCTransform
+Integration method tested:
+  CCA - 3k features, reference = c(1:6)
+  rPCA - 5k features, reference = c(1:6)
+
+```{r}
+### select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = MP.list, nfeatures = 5000)
+
+MP.list <- PrepSCTIntegration(object.list = MP.list, anchor.features = features)
+
+anchors <- FindIntegrationAnchors(object.list = MP.list, reference = c(1:6),
+                                  normalization.method = "SCT", anchor.features = features,
+                                  dims = 1:30, reduction = "cca", k.anchor = 5)
+
+MP_Plaque <- IntegrateData(anchorset = anchors, normalization.method = "SCT", new.assay.name = "integrated", k.weight=100, dims = 1:30)
+ 
+```
+```{r}
+saveRDS(MP_Plaque, paste0(data_dir, "MP_Plaque.Nov2023.rds"))
+```
+
+
+## Re-clustering the macrophage cells based on the CCA-integrated assay
+
+### determine the number of PCs to use from the elbow plot
+```{r}
+DefaultAssay(MP_Plaque) <- "integrated"
+MP_Plaque <- RunPCA(MP_Plaque, verbose = FALSE)
+ElbowPlot(MP_Plaque, ndims = 40)
+```
+### UMAP visualization
+```{r}
+MP_Plaque <- RunUMAP(MP_Plaque, reduction = "pca", dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+```
+```{r}
+MP_Plaque <- FindNeighbors(MP_Plaque, reduction = "pca", dims = 1:20, k.param = 20)  
+```
+```{r}
+#DefaultAssay(MP_Plaque) <- "integrated"
+MP_Plaque <- FindClusters(MP_Plaque, resolution = 0.3)
+MP_Plaque$RNA_clusters <- MP_Plaque$seurat_clusters
+
+DimPlot(MP_Plaque, reduction = "umap.rna", group.by = "RNA_clusters", label = T, repel = T)
+
+```
+## plot batch effect
+```{r}
+DimPlot(MP_Plaque, reduction = "umap.rna", group.by = c("study_id","batch")) 
+```
+## Annotation
+
+### Wilcoxon test
+```{r}
+Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
+source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+
+DefaultAssay(MP_Plaque) <- "RNA"
+markers <- wilcoxauc(MP_Plaque, group_by = "RNA_clusters")
+```
+
+
+### Manual annotation based on marker genes of previously reported macrophage populations
+```{r}
+MP_markers = c("CCR7", # mature cDC2
+               "CLEC9A", # CLEC9A+ DC (cDC1)
+               "CD1C", # CD1+ DCs (cDC2)
+               "S100A8","S100A9","S100A12", "FCN1", "IL1B", # S100A8hi MΦ
+               "TREM2", "SPP1", "CD9", "CHI3L1","LPL", # LAM
+               "TREM1", "PLIN2","CCL7","CCL2","CD36",  # CCL7+
+               "IGSF21","CCL4", "SELENOP", "FOLR2", "C1QB", # IGSF21+ MΦ
+               "IFIT3","IFIT1","CXCL10","IFI44L"  # IFG
+               )
+
+DotPlot(MP_Plaque,  assay = "RNA",features = MP_markers, cluster.idents = T,
+        scale.by = "radius") + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+ scale_color_gradient2(limits = c(-2.5,2.5), low = '#3361A5', high =  '#A31D1D', 
+                                                                                             mid = 'grey95', midpoint=0)
+```
+
+```{r}
+MP_Plaque$subtype <- plyr::revalue(MP_Plaque$RNA_clusters, c("0" = "IGSF21+ MΦ",
+                                                              "1" = "S100A8/S100A12+ MΦ",
+                                                              "2" = "Lipid-associated MΦ",
+                                                              "3" = "PLIN2hi/TREM1hi MΦ",
+                                                              "4" = "Damaged cells (excluded)",
+                                                              "5" = "cDC2",
+                                                              "6" = "IFNG-activated MΦ",
+                                                              "7" = "cDC1",
+                                                              "8" = "S100A8/S100A12- MΦ",
+                                                              "9" = "Mature cDC2"
+                                                              ))
+```
+
+```{r}
+saveRDS(MP_Plaque, paste0(data_dir, "MP_Plaque.Nov2023.rds"))
+```
+
+## Reference mapping using Seurat's CCA pipeline 
+```{r}
+MP_Plaque <- readRDS(paste0(data_dir, "MP_Plaque.Nov2023.rds")) %>% 
+  subset(RNA_clusters!="4")
+
+MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+  subset(RNA_clusters %in% c(0:5,8))
+```
+
+```{r}
+anchors <- FindTransferAnchors(
+  reference = MP_Plaque,
+  reference.assay = "integrated",
+  query = MP_oxldl,
+  query.assay = "RNA",
+  normalization.method = "SCT",
+  reference.reduction = "pca",
+  dims = 1:20,
+  reduction = "pcaproject",
+  k.anchor=5
+)
+```
+
+### with MapQuery (Seurat v4)
+
+```{r}
+MP_Plaque <- RunUMAP(MP_Plaque, dims = 1:20, reduction = "pca", return.model = TRUE, reduction.name = "umap.rna")
+MP_oxldl <- MapQuery(anchorset = anchors, reference = MP_Plaque, query = MP_oxldl,
+    refdata = list(Plaque_clusters = "RNA_clusters"), reference.reduction = "pca", reduction.model = "umap.rna")
+```
+
+### Visualization
+```{r}
+p2.1 <-DimPlot(MP_Plaque, reduction = "umap.rna", group.by = "RNA_clusters", label = F, cols = ggsci::pal_d3()(10)) + 
+  ggtitle("Plaque Macrophages") 
+
+p2.2 <- DimPlot(MP_oxldl, reduction = "ref.umap", group.by = "predicted.Plaque_clusters", label = F, cols = ggsci::pal_d3()(10)[c(1:3,5,6)]) + 
+  ggtitle("Ex vivo Macrophages - Projection") 
+
+p2.3 <- DimPlot(MP_oxldl, reduction = "ref.umap", group.by = "treatment", label = F,
+    label.size = 0, repel = F, cols = c("#0099CC","#FF6666")) + 
+  ggtitle("Ex vivo Macrophages - Treatment") 
+
+p <- (p2.1 + p2.2 + p2.3) & theme_bw() &xlim(c(-8,13)) & ylim(c(-8,8))
+```
+```{r}
+jpeg(file="./umap_projection.jpeg")
+DimPlot(MP_oxldl, reduction = "ref.umap", group.by = "predicted.Plaque_clusters", label = F, cols = ggsci::pal_d3()(10)[c(1,3:6)]) + 
+  xlim(c(-8,13)) + ylim(c(-8,8))
+dev.off()
+
+
+```
+
+```{r}
+DimPlot(MP_oxldl, reduction = "umap", group.by = "predicted.Plaque_clusters", label = TRUE,
+    label.size = 3, repel = TRUE) + NoLegend() + 
+  ggtitle("Transferred labels")
+```
+```{r}
+saveRDS(MP_oxldl, "~/Oxford/Results/scRNA/MP_scRNA_filtered.Nov2023.rds")
+```
+## Evaluation (CCA)
+```{r}
+predictions <- TransferData(anchorset = anchors, refdata = MP_Plaque$RNA_clusters,  dims = 1:20)
+
+df_pred_seurat <- predictions[,paste0("prediction.score.", c(0:3,5:9))]
+colnames(df_pred_seurat) <- c(0:3,5:9)
+
+stopifnot(all(rownames(df_pred_seurat) == rownames(MP_oxldl@meta.data)))
+df_pred_seurat$treatment <- MP_oxldl$treatment
+```
+```{r}
+p.seurat <- df_pred_seurat %>% 
+  reshape2::melt(id.vars="treatment") %>%
+  ggplot(aes(x=variable, y = value, color=treatment, group=treatment)) +
+  scale_color_manual(values = c("buffer"="#0099CC","oxldl" = "#FF6666"))+
+  ggrastr::geom_quasirandom_rast(dodge.width = 0.9) +
+  stat_summary(fun = median, fun.min = median, fun.max = median,
+              geom = "crossbar", width = 0.4, color="black",position = position_dodge(0.9)) +
+  ylab("Probability") + 
+  scale_x_discrete(label = c("0" = expression(paste("IGSF21"^"+", " MΦ")),
+                            "1" = expression(paste("S100A8/S100A12"^"+", " MΦ")),
+                            "2" = expression("Lipid-associated MΦ"),
+                            "3" = expression(paste("PLIN2"^"hi","/TREM1"^"hi"," MΦ")),
+                            "5" = expression("cDC2"),
+                            "6" = expression("IFNG-activated MΦ"),
+                            "7" = expression("cDC1"),
+                            "8" = expression(paste("S100A8/S100A12"^"-", " MΦ")),
+                            "9" = expression("Mature cDC2"))
+                   ) + 
+  ggtitle("Label transfer (Seurat)") + 
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+      legend.position = "right",
+      axis.title.x = element_blank()
+    )
+```
+```{r}
+p.seurat
+```
+
+# Convert Seurat object to AnnData for scvi-tools
+## Full plaque macrophage atlas
+```{r}
+library(reticulate)
+use_condaenv("spatial")
+```
+
+```{r}
+MP_Plaque <- readRDS(paste0(data_dir, "MP_Plaque.Nov2023.rds")) %>% 
+  subset(subtype!="Damaged cells (excluded)")
+DefaultAssay(MP_Plaque) <- "RNA"
+exprs <- GetAssayData(MP_Plaque, slot = "counts")
+meta <- MP_Plaque[[]]
+feature_meta <- GetAssay(MP_Plaque)[[]]
+embedding <- Embeddings(MP_Plaque, "umap.rna")
+```
+
+```{python}
+import scanpy as sc
+adata = sc.AnnData(X = r.exprs.T, obs = r.meta, var = r.feature_meta)
+adata.obsm['umap'] = r.embedding
+
+adata.write("/Users/jhjiang/Oxford/Results/multiome/scVI/data/MP_Plaque.Nov2023.h5ad", compression="gzip")
+```
+
+
+## Ex vivo macrophages - query dataset
+```{r}
+MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+  subset(RNA_clusters %in% c(0:5,8))
+DefaultAssay(MP_oxldl) <- "RNA"
+exprs <- GetAssayData(MP_oxldl, slot = "counts")
+meta <- MP_oxldl@meta.data %>% select(batch, treatment, donor, RNA_clusters)
+feature_meta <- GetAssay(MP_oxldl)[[]]
+embedding <- Embeddings(MP_oxldl, "umap")
+```
+
+```{python}
+import scanpy as sc
+adata = sc.AnnData(X = r.exprs.T, obs = r.meta, var = r.feature_meta)
+adata.obsm['umap'] = r.embedding
+
+adata.write("/Users/jhjiang/Oxford/Results/multiome/scVI/data/MP_oxldl.Nov2023.h5ad", compression="gzip")
+```
+## Evaluation (scANVI)
+```{r}
+df_pred <- read.csv("~/Oxford/Results/multiome/scVI/results/MP_oxldl.Nov2023.pred.csv", row.names = 1)
+colnames(df_pred) <- c(0:3,5:9)
+```
+
+```{r}
+## plot the predictions
+stopifnot(all(rownames(df_pred) == rownames(MP_oxldl@meta.data)))
+df <- df_pred %>% 
+  tibble::rownames_to_column("cell_id") %>% 
+  reshape2::melt(id.vars = "cell_id") %>% 
+  filter(value > 0.5) %>% 
+  select(cell_id, variable) %>% 
+  tibble::column_to_rownames("cell_id")
+
+cells <- rownames(MP_oxldl@meta.data)
+MP_oxldl$scANVI_pred <- df[cells,"variable"]
+```
+```{r}
+saveRDS(MP_oxldl, "~/Oxford/Results/scRNA/MP_scRNA_filtered.Nov2023.rds")
+```
+
+
+```{r}
+
+df_pred$treatment <- MP_oxldl$treatment
+
+p.scanvi <- df_pred %>% 
+  reshape2::melt(id.vars="treatment") %>%
+  ggplot(aes(x=variable, y = value, color=treatment, group=treatment)) +
+  scale_color_manual(values = c("buffer"="#0099CC","oxldl" = "#FF6666"))+
+  ggrastr::geom_quasirandom_rast(dodge.width = 0.9) + 
+  ylab("Probability") + 
+  stat_summary(fun = median, fun.min = median, fun.max = median,
+              geom = "crossbar", width = 0.4, color="black",position = position_dodge(0.9)) +
+  ylab("Probability") + 
+  scale_x_discrete(label = c("0" = expression(paste("IGSF21"^"+", " MΦ")),
+                            "1" = expression(paste("S100A8/S100A12"^"+", " MΦ")),
+                            "2" = expression("Lipid-associated MΦ"),
+                            "3" = expression(paste("PLIN2"^"hi","/TREM1"^"hi"," MΦ")),
+                            "5" = expression("cDC2"),
+                            "6" = expression("IFNG-activated MΦ"),
+                            "7" = expression("cDC1"),
+                            "8" = expression(paste("S100A8/S100A12"^"-", " MΦ")),
+                            "9" = expression("Mature cDC2"))
+                   ) + 
+  ggtitle("Label transfer (scANVI)") + 
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+      legend.position = "right",
+      axis.title.x = element_blank()
+    )
+```
+
+```{r}
+p.scanvi
+```
+
+# Correlation test
+```{r}
+MP_Plaque <- readRDS(paste0(data_dir, "MP_Plaque.Nov2023.rds")) %>%
+  subset( subtype != "Damaged cells (excluded)")
+
+MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+  subset(RNA_clusters %in% c(0:5,8))
+
+## aggregate the counts (log1p normalized)
+MP_Plaque_mtx <- AggregateExpression(MP_Plaque, assays = "RNA", group.by = "subtype", slot = "data",
+                                     normalization.method = "LogNormalize")
+MP_oxldl_mtx <- AggregateExpression(MP_oxldl, assays = "RNA", group.by = "treatment", slot = "data",
+                                    normalization.method = "LogNormalize")
+
+select_genes <- intersect(rownames(MP_Plaque@assays$RNA), rownames(MP_oxldl@assays$RNA))
+
+mtx <- cbind(MP_Plaque_mtx[[1]][select_genes,], MP_oxldl_mtx[[1]][select_genes,]) %>% 
+  as.matrix()
+
+#filter out non-expressing genes
+mtx_filtered <- mtx[rowSums(mtx)>0,]
+```
+```{r}
+cor(mtx_filtered, method = "pearson") %>% 
+  reshape2::melt() %>% 
+  ggplot( aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile() + 
+  geom_text(aes(x=Var1 , y=Var2, label = round(value,2)), 
+            data = . %>% filter(Var1=="oxldl"  | Var1=="buffer" | Var2=="Lipid-associated MΦ")) + 
+  scale_fill_gradient(limits = c(0,1),breaks=c(0,0.2,0.4,0.6,0.8), low = 'grey95', high =  '#A31D1D',name="correlation") +
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+      legend.direction = "vertical",
+      axis.title = element_blank()
+    )
+```
+
+
+
+

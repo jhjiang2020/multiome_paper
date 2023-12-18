@@ -1,0 +1,275 @@
+---
+title: "Meta analysis on human atherosclerotic plaques scRNA-seq dataset"
+output: html_notebook
+---
+
+# Reference dataset
+
+
+**Human plaques scRNA-seq**
+
+* Wirka et al., NatMed 2019
+  + GSE131778 - 11756 Cells in total
+* Pan et al., Circulation 2020
+	+ GSE155512 - 8870 Cells in total
+* Alsaigh et al., Commun. Biol, 2022
+	+ GSE159677 - 39244 cells + 12477 cells
+* Chowdhury et al., Circ Res 2022
+  + GSE196943 - 26352 Cells in total
+* Dib et al., NatCardRes 2023
+  + GSE210152 - 20943 cells 
+
+
+# Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+```
+
+# Load and format datasets
+
+```{r}
+data_dir <- "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/rdata/"
+```
+
+## Load 10X output 
+fastq reads from W2019, P2020, A2022 were re-aligned using CellRanger Count V5 against the prebuild hg38 reference 2020-A
+raw count matrices were downloaded from GEO for C2022 and D2023
+
+
+## Load Count matrix from Chowdhury et al., Circ Res 2022 (raw counts)
+```{r}
+# C2022_counts <- data.table::fread(paste0(data_dir,"GSE196943_counts_matrix.txt.gz")) %>% 
+#   tibble::column_to_rownames("V1")
+# 
+# C2022 <- CreateSeuratObject(counts = C2022_counts, project = "C2019", assay="RNA")
+# 
+# C2022_meta <- colnames(C2022_counts) %>%
+#   stringr::str_split_fixed("_", n=3)
+# 
+# C2022$batch <- paste("C2022",C2022_meta[,2], C2022_meta[,3], sep="_")
+# 
+# saveRDS(C2022, paste0(data_dir,"Chowdhury2022.rds"))
+C2022 <- readRDS(paste0(data_dir,"Chowdhury2022.rds"))
+```
+
+## Load Count matrix from Dib et al., Nat Cardio Res 2023 (ambient-RNA-removed counts)
+```{r}
+# library(reticulate)
+# use_condaenv("spatial")
+# 
+# library(anndata)
+# library(Matrix)
+# D2023 <- read_h5ad(paste0(data_dir,"Dib_2023_raw.h5ad"))
+# D2023 <- CreateSeuratObject(counts = t(D2023$X), meta.data = D2023$obs)
+# 
+# D2023$batch <- paste0("D2023_", D2023$patient)
+# saveRDS(D2023, paste0(data_dir,"Dib2023.rds"))
+D2023 <- readRDS(paste0(data_dir,"Dib2023.rds"))
+```
+
+## Merge count matrices
+```{r}
+data_dir <- list.dirs(path = "./Counts/", full.names = T, recursive=F) %>% paste0("/outs/filtered_feature_bc_matrix/")
+data_name <- list.dirs(path = "./Counts/", full.names = F, recursive=F)
+
+## add study id for each sample
+data_name <- paste0(c(rep("A2022_",6), rep("P2020_",3), rep("W2019_", 8)), data_name) %>% 
+    gsub(pattern="PAN-", replacement="")
+
+data <- lapply(data_dir, Read10X)
+
+names(data) <- data_name
+Human_Plaque.list <- lapply(data, CreateSeuratObject, project = "Meta-Plaque")
+for( i in 1:length(data_name)){
+  Human_Plaque.list[[i]]@meta.data$batch <- data_name[i]
+  Human_Plaque.list[[i]]@meta.data$study_id <- gsub(x=data_name[i], pattern="(^[A-Z]20[0-9]+)_.*", replacement="\\1")
+}
+
+C2022 <- readRDS("./Chowdhury2022.rds")
+C2022$orig.ident <- "Meta-Plaque"
+C2022$study_id <- "C2022"
+
+
+D2023 <- readRDS("./Dib2023.rds")
+D2023$orig.ident <- "Meta-Plaque"
+D2023$study_id <- "D2023"
+
+Human_Plaque <- merge(C2022, Human_Plaque.list) %>% 
+  merge(D2023)
+saveRDS(Human_Plaque, "./Human_Plaque.AWP.rds")
+```
+
+## filterout low-quality cells
+```{r}
+Human_Plaque <- PercentageFeatureSet(Human_Plaque, pattern = "^MT-", col.name = "percent.mt") %>%
+    subset( nFeature_RNA >=200 & nCount_RNA >= 500 & percent.mt <= 20)
+```
+
+## Doublet removal with DoubletFinder
+```{r}
+library(DoubletFinder)
+Human_Plaque.list <- SplitObject(Human_Plaque, split.by = "study_id")
+
+prep_data <- function(seu){
+  seu <- seu %>%
+    NormalizeData() %>% 
+    FindVariableFeatures(nfeatures=2000) %>% 
+    ScaleData() %>% 
+    RunPCA() %>% 
+    RunUMAP(dims=1:10, verbose = F)
+}
+
+Human_Plaque.list <- lapply(Human_Plaque.list, prep_data)
+
+sweep.res.list <- lapply(Human_Plaque.list, paramSweep_v3, PCs=1:10, sct=F)
+sweep.stats.list <- lapply(sweep.res.list, summarizeSweep, GT=F)
+
+## determine the pK value for each dataset by BC-plots
+bcmvn.list <- lapply(sweep.stats.list, find.pK)
+
+#C2022=0.24
+#A2022=0.001
+#P2020=0.08
+#W2019=0.04
+#D2023=0.005
+
+pK <- c(0.24, 0.001, 0.08, 0.04, 0.005)
+```
+
+```{r}
+## Run DoubletFinder with nExp=5%  ----------------------------------------------------------------
+for(i in 1:5){
+  Human_Plaque.list[[i]] <- doubletFinder_v3(Human_Plaque.list[[i]], PCs = 1:10, pN = 0.25, pK =pK[[i]], nExp = round(0.05*length(Cells(Human_Plaque.list[[i]]))), reuse.pANN = FALSE, sct = FALSE)
+}
+
+Human_Plaque.list <- lapply(Human_Plaque.list, FUN=function(x){
+  col_names <- colnames(x@meta.data) %>% 
+    gsub(pattern="^pANN_0.25_0.[0-9]+_[0-9]+$", replacement="pANN.scores") %>% 
+    gsub(pattern="^DF.classifications_0.25_0.[0-9]+_[0-9]+$", replacement="DF.classifications")
+  colnames(x@meta.data) <- col_names
+  return(x)
+})
+
+Human_Plaque <- merge(Human_Plaque.list[[1]], y=Human_Plaque.list[2:5])
+Human_Plaque <- subset(Human_Plaque, DF.classifications=="Singlet")
+```
+
+# Meta-analysis of human atherosclerotic plaque scRNA-seq 
+```{r}
+Human_Plaque <- readRDS(paste0(data_dir,"Human_Plaque.Nov2023.rds"))
+```
+## Seurat log normalization
+```{r}
+Human_Plaque <- Human_Plaque %>% 
+  NormalizeData() %>% 
+  FindVariableFeatures(nfeatures=5000) %>%
+  ScaleData() %>% 
+  RunPCA(verbose = FALSE)
+```
+
+## Harmony batch correction
+```{r}
+library(harmony)
+Human_Plaque <- RunHarmony(Human_Plaque, group.by.vars = "batch")
+```
+```{r}
+# the number of reduced dimensions to use in the clustering is determined heuristically based on the elbow plot
+ElbowPlot(Human_Plaque,reduction = "harmony", ndims = 40)
+```
+
+## Clustering with Seurat's default Louvain algorithm
+```{r}
+Human_Plaque <- RunUMAP(Human_Plaque, 
+                        reduction = "harmony", 
+                        dims = 1:19, reduction.name = "umap.harmony")
+Human_Plaque <- FindNeighbors(Human_Plaque, 
+                              reduction = "harmony", dims = 1:19) 
+Human_Plaque <- FindClusters(Human_Plaque, resolution = 0.1) # this resolution of 0.1 was chosen empirically to separate different cell types while keeping the same cell type as a single cluster
+Human_Plaque$RNA_clusters <- Human_Plaque$seurat_clusters
+
+table(Human_Plaque$RNA_clusters)
+```
+
+```{r}
+DimPlot(Human_Plaque, reduction = "umap.harmony", group.by = c("seurat_clusters"), label = T, repel = T)
+```
+
+
+```{r}
+DimPlot(Human_Plaque, reduction = "umap.harmony", group.by = c("batch"))
+```
+
+## Cell type annotation using SingleR
+```{r}
+library(SingleR)
+library(celldex)
+#hpca.se <- HumanPrimaryCellAtlasData()
+ecbp.se <- celldex::BlueprintEncodeData()
+ 
+```
+
+```{r}
+pred.human_plaques <- SingleR(test = GetAssayData(Human_Plaque, assay = "RNA"),
+                              clusters = Human_Plaque$RNA_clusters, ref = ecbp.se, 
+                              labels = ecbp.se$label.main)
+
+pred.human_plaques
+```
+
+## Cell type annotation based on previously reported marker genes
+
+"PECAM1", "VWF", "PLVAP", # EC
+"TYMS","MKI67","CENPM", # Mitotic T Cell
+"CD14","CD68","AIF1", # Macrophage
+"ACTA2","TAGLN","MYL9", # VSMC
+"CD3E","TRAC","NKG7", # T cell NK cell
+"CD79A", "MS4A1", "BANK1", # B cell
+"FKBP11","SLAMF7","JCHAIN", # Plasma cell
+"TPSAB1","CPA3","MS4A2", # Mast Cell
+"VWA1", "FOXD3-AS1", "CADM3", # Fibroblast
+"BCL11A", "SELL", "MYCL" # DC
+* the cell-type-specific expression patterns of marker genes listed above have been mannually inspected with the single-cell expression panel from www.proteinatlas.org
+
+### Wiloxon test to find marker genes
+```{r}
+Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
+source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+
+markers <- wilcoxauc(Human_Plaque, group_by = "RNA_clusters")
+```
+
+### plot marker genes
+```{r}
+Human_Plaque$cell_type <- plyr::revalue(Human_Plaque$seurat_clusters, c("0" = "T Cell & NK Cell",
+                                                                        "1" = "VSMC",
+                                                                        "2" = "Macrophage",
+                                                                        "3" = "Endothelial Cell",
+                                                                        "4" = "B Cell",
+                                                                        #"5" = "Plasma Cell",
+                                                                        "5" = "Mast Cell",
+                                                                        "6" = "Mitotic T Cell",
+                                                                        "7" = "Dendritic Cell"
+                                                                        ))
+DotPlot(Human_Plaque,  assay = "RNA",
+        features = c("CD3E","TRAC","NKG7", # T cell NK cell
+                     "ACTA2","TAGLN","MYL9", # VSMC
+                     "CD14","CD68","AIF1", # Macrophage 
+                     "PECAM1", "VWF", "PLVAP", # EC
+                     "CD79A", "MS4A1", "BANK1", # B cell
+                     #"FKBP11","SLAMF7", "JCHAIN", # Plasma cell
+                     "TPSAB1","CPA3","MS4A2", # Mast Cell
+                     "TYMS","MKI67","CENPM", # Mitotic T Cell
+                     "BCL11A", "SELL", "MYCL" # DC
+                     ),scale.by = "radius") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+```{r}
+saveRDS(Human_Plaque,paste0(data_dir, "Human_Plaque.Nov2023.rds"))
+```
+
+
+
+

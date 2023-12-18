@@ -1,0 +1,262 @@
+---
+title: "Integration of two modalities using Seurat WNN workflow with harmony batch correction on the ATAC assay"
+output: html_notebook
+---
+
+# Load packages
+
+```{r}
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(dplyr)
+library(ggplot2)
+library(harmony)
+```
+
+# Load and format datasets
+```{r}
+data_dir <- "~/Oxford/Results/multiome/data/"
+```
+
+```{r}
+Read10X_multiome <- function(dir_name){
+  h5_dir <- paste(dir_name, "filtered_feature_bc_matrix.h5", sep = "/")
+  frag_dir <- paste(dir_name, "atac_fragments.tsv.gz", sep = "/")
+  
+  # the 10x hdf5 file contains both data types. 
+  inputdata.10x <- Read10X_h5(h5_dir)
+  rna_counts <- inputdata.10x$`Gene Expression`
+  atac_counts <- inputdata.10x$Peaks
+  
+  # Create Seurat object
+  MP <- CreateSeuratObject(counts = rna_counts)
+  MP[["percent.mt"]] <- PercentageFeatureSet(MP, pattern = "^MT-")
+
+  # Now add in the ATAC-seq data
+  # we'll only use peaks in standard chromosomes
+  grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+  grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+  atac_counts <- atac_counts[as.vector(grange.use), ]
+  annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+  seqlevelsStyle(annotations) <- 'UCSC'
+  genome(annotations) <- "hg38"
+  
+
+  chrom_assay <- CreateChromatinAssay(
+    counts = atac_counts,
+    sep = c(":", "-"),
+    genome = 'hg38',
+    fragments = frag_dir,
+    min.cells = 10,
+    annotation = annotations
+  )
+  MP[["ATAC"]] <- chrom_assay
+  return(MP)
+}
+
+Compute_ATAC_QC_metrics <- function(object){
+  DefaultAssay(object) <- "ATAC"
+  # compute nucleosome signal score per cell
+  object <- NucleosomeSignal(object = object)
+
+  # compute TSS enrichment score per cell
+  object <- TSSEnrichment(object = object, fast = FALSE)
+
+  # add blacklist ratio and fraction of reads in peaks
+  #object$pct_reads_in_peaks <- object$peak_region_fragments / object$passed_filters * 100
+  #object$blacklist_ratio <- object$blacklist_region_fragments / object$peak_region_fragments
+  #object$high.tss <- ifelse(object$TSS.enrichment > 2, 'High', 'Low')
+  return(object)
+}
+
+CC_difference <- function(object){
+  object$CC.Difference <- object$S.Score - object$G2M.Score
+  return(object)
+}
+
+
+Read_broadPeak <- function(file){
+  df <- read.table(file = file,col.names = c("chr", "start", "end", "name","score", "strand", "fold_change","neg_log10pvalue_summit", "neg_log10qvalue_summit"))
+  gr <- makeGRangesFromDataFrame(df = df, keep.extra.columns = TRUE)
+  return(gr)
+}
+```
+
+
+```{r}
+files_dir <- list.dirs(path = data_dir, full.names = T, recursive = F) 
+
+MP <- lapply(data_dir, Read10X_multiome)
+names(MP) <- list.dirs(path = data_dir, full.names = F, recursive = F) 
+
+id <- c(paste("buffer", 1:4, sep = "_"), "oxldl_1", paste("oxldl", 3:4, sep = "_") )
+for( i in 1:length(MP)){
+  MP[[i]]@meta.data$orig.ident <- id[i]
+}
+```
+
+# pre-integration QC
+```{r }
+MP <- lapply(MP, NormalizeData)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+MP <- lapply(MP, CellCycleScoring,assay="RNA", s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+MP <- lapply(MP, CC_difference)
+
+MP <- lapply(MP, PercentageFeatureSet, pattern = "^MT-", col.name = "percent.mt")
+MP <- lapply(MP, PercentageFeatureSet, pattern = "^RPS", col.name = "percent.rps")
+MP <- lapply(MP, PercentageFeatureSet, pattern = "^RPL", col.name = "percent.rpl")
+MP <- lapply(MP, Compute_ATAC_QC_metrics) 
+
+## filter out low quality cells
+MP <- lapply(MP, subset,
+             subset = nCount_ATAC < 100000 &
+               nCount_RNA < 50000 &
+               nCount_ATAC > 1000 &
+               nCount_RNA > 1000 &
+               nucleosome_signal < 2 &
+               TSS.enrichment > 1
+)
+
+MP <- merge(MP[[1]], MP[2:8])
+```
+
+# Recall peaks using MACS3
+
+The atac-seq fragments output from 10X CellRanger-ARC pipeline were trimmed to retain the 9bp Tn5 cut sites at both ends and aggregated into one consensus bed file. We then recalled peaks using `MACS3 --qvalue 1e-5 --nomodel --shift -50 --extsize 100  --broad`
+ 
+see discussion in https://github.com/stuart-lab/signac/issues/682
+
+## Count reads in MACS3 peaks
+```{r}
+DefaultAssay(MP) <- "ATAC"
+peaks <- Read_broadPeak(paste0(data_dir, "multiome_peaks.broadPeak"))
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+
+# quantify counts in each peak
+macs3_counts <- FeatureMatrix(
+  fragments = Fragments(MP),
+  features = peaks,
+  cells = colnames(MP)
+)
+ 
+```
+## Add assay to seurat object
+```{r}
+# get gene annotations for hg38
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotation) <- "UCSC"
+genome(annotation) <- "hg38"
+
+# create a new assay using the MACS3 peak set and add it to the Seurat object
+MP[["peaks"]] <- CreateChromatinAssay(
+ counts = macs3_counts,
+ fragments = Fragments(MP@assays$ATAC),
+ annotation = annotation
+)
+
+```
+
+# WNN integration 
+
+## Integrate RNA assay
+### SCTransform and CCA integration
+```{r}
+MP <- SplitObject(MP, split.by = "orig.ident")
+MP <- lapply(MP, SCTransform, assay = "RNA", verbose=F, vars.to.regress = c("CC.Difference", "percent.mt"))
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = MP, nfeatures = 3000)
+MP <- PrepSCTIntegration(object.list = MP, anchor.features = features)
+
+anchors <- FindIntegrationAnchors(object.list = MP, normalization.method = "SCT",
+    anchor.features = features)
+MP.integrated <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+### PCA on integrated RNA assay
+```{r}
+DefaultAssay(MP.integrated) <- "integrated"
+MP.integrated <- RunPCA(MP.integrated, verbose = FALSE)
+ElbowPlot(MP.integrated, ndims = 30)
+```
+### UMAP and clustering 
+```{r}
+MP.integrated <- RunUMAP(MP.integrated, reduction = "pca", dims = 1:26, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+MP.integrated <- FindNeighbors(MP.integrated, reduction = "pca", dims = 1:26)  
+MP.integrated <- FindClusters(MP.integrated, resolution = 0.4)
+MP.integrated$RNA_clusters <- MP.integrated$seurat_clusters
+```
+
+## Integrate ATAC assay
+
+### Normalization and PCA with SVD for ATAC assay
+
+```{r}
+DefaultAssay(MP.integrated) <- "peaks"
+
+MP.integrated <- FindTopFeatures(MP.integrated, min.cutoff = 5)
+MP.integrated <- RunTFIDF(MP.integrated) #Term frequency - inverse document frequency transformation
+MP.integrated <- RunSVD(MP.integrated) # Single Value Decomposition
+
+```
+
+### Batch effect correction with Harmony
+```{r}
+MP.integrated <- RunHarmony(
+  object = MP.integrated,
+  group.by.vars = 'orig.ident',
+  reduction = 'lsi',
+  assay.use = 'peaks',
+  project.dim = FALSE,
+  plot_convergence = T
+)
+
+```
+### UMAP and clustering on ATAC assay
+```{r}
+DefaultAssay(MP.integrated) <- "peaks"
+MP.integrated <- RunUMAP(object = MP.integrated, reduction = 'harmony', dims = 2:10, reduction.name = 'umap.atac', reduction.key = 'atacUMAP_')
+MP.integrated <- FindNeighbors(object = MP.integrated, reduction = 'harmony', dims = 2:10)
+MP.integrated <- FindClusters(object = MP.integrated, 
+                                verbose = FALSE,
+                                resolution = 0.3 
+                              )
+MP.integrated@meta.data$ATAC_clusters <- MP.integrated@meta.data$seurat_clusters
+```
+
+## Joint clustering using WNN
+### build a joint neighbor graph using both assays
+```{r}
+MP.integrated <- FindMultiModalNeighbors(
+  object = MP.integrated,
+  reduction.list = list("pca", "harmony"), 
+  dims.list = list(1:26, 2:10),
+  modality.weight.name = c("RNA.weight", "ATAC.weight"),
+  verbose = TRUE
+)
+```
+
+### build a joint UMAP visualization
+```{r}
+MP.integrated <- RunUMAP(
+  object = MP.integrated,
+  nn.name = "weighted.nn",
+  verbose = TRUE,
+  reduction.name = "umap.wnn",
+  reduction.key = "wnnUMAP_"
+)
+
+MP.integrated <- FindClusters(MP.integrated, graph.name = "wsnn", algorithm = 3, verbose = FALSE, resolution = 0.2)
+
+MP.integrated@meta.data$Joint_clusters <- MP.integrated@meta.data$seurat_clusters
+```
+

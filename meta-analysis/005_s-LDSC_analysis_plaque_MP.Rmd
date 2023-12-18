@@ -1,0 +1,339 @@
+---
+title: "s-LDSC analysis of plaque macrophages"
+output: html_notebook
+---
+# Load Packages
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(Signac)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+```
+
+# Load objects
+```{r}
+## Get the cres
+cres <- readRDS("~/Oxford/Code/R/multiome/003_Downstream_GWAS/linked_peaks_df.rds")
+
+## Plaque macrophage atlas
+MP_Plaque <- readRDS("~/Oxford/Results/multiome/multiome_share/005_meta_analysis/rdata/MP_Plaque.Nov2023.filtered.rds")
+
+## Output dir for BED files
+outdir <- "~/Oxford/Results/multiome/ldsc/Plaque/cont_plaque/"
+```
+
+# Construct marker gene programs
+
+## Wilcoxon test
+```{r}
+Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
+source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+
+
+DefaultAssay(MP_Plaque) <- "RNA"
+markers <- wilcoxauc(MP_Plaque, group_by = "RNA_clusters")
+```
+
+## Convert test statistics to gene scores
+```{r}
+get_scores <- function(df){
+  ## replace zero p values with the mininal non-zero pval to avoid errors when converting to the log scale
+  min_p <- df %>% 
+  filter(pval > 0) %>% 
+  pull(pval) %>% 
+  min
+  
+  df2 <- df %>% 
+           mutate(X = ifelse(pval>0,-2*log(pval), -2*log(min_p))) %>% 
+           group_by(group) %>% 
+           mutate(score=(X-min(X))/(max(X)-min(X))) %>%
+           ungroup %>% 
+           select(feature, score, group)
+  
+  return(df2)
+}
+
+markers <- get_scores(markers)
+colnames(markers) <- c("gene", "score", "cluster")
+```
+
+## Annotate genomic regions with gene scores
+The CRE map used here is identified in ex vivo macrophage populations
+
+```{r}
+## Get the cis-regulatory peaks targeting MP marker genes
+MP.marker.cres <- merge(markers, cres %>% select(gene,peak), 
+                         by = "gene", all.x = F) # only keep the genes that have at least one CRE
+
+MP.marker.cres$subtype <- plyr::revalue(MP.marker.cres$cluster, c("0" = "IGSF21+ MΦ",
+                                                              "1" = "S100A8/S100A12+ MΦ",
+                                                              "2" = "Lipid-associated MΦ",
+                                                              "3" = "PLIN2hi/TREM1hi MΦ",
+                                                              "5" = "cDC2",
+                                                              "6" = "IFNG-activated MΦ",
+                                                              "7" = "cDC1",
+                                                              "8" = "S100A8/S100A12- MΦ",
+                                                              "9" = "Mature cDC2"
+                                                              ))
+```
+
+## Output for s-LDSC
+```{r}
+for(i in c(0:3,5:9)){
+  df <- MP.marker.cres %>% 
+    filter(cluster == i) %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+  df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+  data.table::fwrite(df2, file = paste0(outdir,"cluster_",i,".bed"), sep = "\t", quote = F, col.names = F)
+}
+
+```
+
+# Construct disease gene programs 
+## Wilcoxon test per cluster
+```{r}
+MP_Plaque$group <- "Plaque"
+MP_Plaque$group[MP_Plaque$batch %in% c("A2022_PA1", "A2022_PA2", "A2022_PA3")] = "Control"
+Idents(MP_Plaque) <- "group"
+
+MP.plaque.genes.all <- list()
+j=1
+## skip cluster_9 which does not have control cells
+for (i in c(0:3,5:8)){
+  try({
+    object <- subset(MP_Plaque, RNA_clusters==i)
+    diff <- wilcoxauc(object, group_by="group") %>% 
+      filter(group=="Plaque")
+    MP.plaque.genes.all[[j]] <- diff
+    j=j+1
+})
+}
+names(MP.plaque.genes.all) <- paste0("cluster_", c(0:3,5:8))
+
+```
+
+## Wilcoxon test - pseudo-bulk disease vs control
+```{r}
+MP.plaque.genes.ps <- wilcoxauc(MP_Plaque, group_by = "group") %>% 
+  filter(group=="Plaque")
+```
+
+## Convert test statistics to gene scores
+```{r}
+## annotate CREs
+MP.plaque.genes.all <- lapply(MP.plaque.genes.all, FUN = function(x){
+  min_p <- x %>% 
+    filter(pval > 0) %>% 
+    pull(pval) %>% 
+    min
+  
+  ## assign the mininal non-zero pval to genes with pval=0
+  x <- x %>% 
+    mutate(X = ifelse(pval>0,-2*log(pval), -2*log(min_p))) %>% 
+    mutate(score=(X-min(X))/(max(X)-min(X))) %>% 
+    select(feature, score)
+  colnames(x) <- c("gene", "score")
+  return(x)
+})
+
+MP.plaque.cres <- lapply(MP.plaque.genes.all, FUN = function(x){
+  merge(x, cres %>% select(gene,peak), by = "gene", all.x = F) # only keep genes that have at least one link) 
+})
+names(MP.plaque.cres) <-paste0("cluster_", c(0:3,5:8))
+
+
+min_p <- MP.plaque.genes.ps %>% 
+    filter(pval > 0) %>% 
+    pull(pval) %>% 
+    min
+
+MP.plaque.cres.ps <- MP.plaque.genes.ps %>% 
+  mutate(X = ifelse(pval>0,-2*log(pval), -2*log(min_p))) %>% 
+  mutate(score=(X-min(X))/(max(X)-min(X))) %>% 
+  mutate("gene"=feature) %>% 
+  select(gene, score) %>%
+  merge( cres %>% select(gene,peak), by = "gene", all.x = F) 
+
+
+```
+
+## Output for s-LDSC
+
+```{r}
+for(i in paste0("cluster_", c(0:3,5:8))){
+  df <- MP.plaque.cres[[i]] %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+  df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+  data.table::fwrite(df2, file = paste0(outdir,"PvsC_",i,".bed"), sep = "\t", quote = F, col.names = F)
+}
+
+
+df <- MP.plaque.cres.ps %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+data.table::fwrite(df2, file = paste0(outdir,"PvsC_pseudobulk.bed"), sep = "\t", quote = F, col.names = F)
+
+
+```
+
+# Post-processing of s-LDSC results
+## Compute Enrichment scores and Tau*
+```{r}
+Mref = 6482770 # the total number of variants included in the analysis
+h2g_CAD = 0.0543 # total observed scale SNP h2 
+cov_mat = readRDS("~/Oxford/Results/multiome/ldsc/Plaque/plaque_MP_programs_cov.rds") # co-variance matrix of annotation files for standardization of tau
+ldsc.results <- read.table("~/Oxford/Results/multiome/ldsc/Plaque/CAD_plaqueMP.Nov2023.results", header = T) %>% 
+  filter(Category!="BaseL2_0")
+
+## Calculate enrichment scores
+enr_background <- read.table("~/Oxford/Results/multiome/ldsc/Subtype_CRE/CAD_cres.results", header = T) %>%
+  filter(Category=="multiome_allpeaksL2_0") %>%
+  mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs))) %>%
+  pull(EnrStat)
+
+df_enr <- ldsc.results %>% 
+  mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs)),
+         EnrStat.z = -qnorm(Enrichment_p/2)) %>% 
+  mutate(EnrStat.se = EnrStat/EnrStat.z) %>% 
+  mutate(Enr.score = EnrStat/enr_background)
+
+
+## Calculate tau star
+sd_sub <- diag(cov_mat) %>% sqrt()
+coef_sub = sd_sub*Mref/h2g_CAD
+
+
+df_enr$Taus <- df_enr$Coefficient * coef_sub
+df_enr$Taus.se <- df_enr$Coefficient_std_error * coef_sub
+df_enr$Taus.p <- dnorm(df_enr$Coefficient_z.score)/2
+
+df_enr$Cluster <- gsub(pattern = "cluster_([0-9])L2_0", replacement = "\\1", x=df_enr$Category)
+df_enr$subtype <- plyr::revalue(df_enr$Cluster, c("0" = "IGSF21+ MΦ",
+                                                              "1" = "S100A8/S100A12+ MΦ",
+                                                              "2" = "Lipid-associated MΦ",
+                                                              "3" = "PLIN2hi/TREM1hi MΦ",
+                                                              "4" = "Damaged cells (excluded)",
+                                                              "5" = "cDC2",
+                                                              "6" = "IFNG-activated MΦ",
+                                                              "7" = "cDC1",
+                                                              "8" = "S100A8/S100A12- MΦ",
+                                                              "9" = "Mature cDC2"
+                                                              ))
+  
+  
+df_enr$subtype <- factor(df_enr$subtype, levels = df_enr$subtype)
+df_enr$id <- 1:nrow(df_enr)
+
+write.csv(df_enr, "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/ldsc_markers.csv")
+```
+
+## Visualization 
+```{r}
+n_cluster <- nrow(df_enr)
+
+
+df_enr %>% 
+  mutate(flag = ifelse(Taus.p <= 0.1, ifelse(Taus.p <=0.05, "1", "2"), "3")) %>% 
+  ggplot(aes(x=subtype, y=rep(1,n_cluster), size = Enr.score)) +
+    geom_point(aes(color = Taus),alpha=1, stroke = 1) +
+    scale_color_gradient2(limits = c(-3,3), low = '#3361A5', high =  '#A31D1D', 
+                        mid = 'grey98', midpoint=0, breaks=c(-2,0,2),name = bquote("Effect"~"sizes"~tau*"*")) + 
+    scale_y_continuous(limits=c(0.5,1.5),breaks = 1, position = "left", labels = "Plaque macrophage\nmarker programs") +
+    scale_size_continuous(limits = c(0.3, 9), breaks = c(2,4,6), name = "Enrichment over background") +
+    ggforce::geom_circle(aes(x0=as.numeric(id), y0=1, r=0.2, linetype = flag), color='black', size=0.75, inherit.aes=F) + 
+    scale_linetype_manual(values = c("1" = "solid", "2" = "dotted", "3"="blank"),name = "Significance", labels=c("1"="p<0.05","2"="p<0.1","3"="") ) + 
+    coord_fixed() +
+    guides(size = guide_legend(override.aes = list(fill="black"), title.position="top"),
+           color = guide_colorbar(frame.colour = "black", ticks.colour = "black", frame.linewidth = 1, nrow=1, title.position="top"),
+           linetype = guide_legend(title.position="top")) +
+    theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) +
+    theme(axis.line=element_blank(),
+      axis.text.x = element_text(angle = 60, vjust = 1, hjust=1),
+      #axis.text.y=element_blank(),
+      #axis.ticks=element_blank(),
+      axis.title.x=element_blank(),
+      axis.title.y=element_blank(),
+      legend.position="top",
+      #panel.background=element_blank(),
+      #panel.border=element_blank(),
+      #panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank(),
+      plot.background=element_blank())
+```
+
+```{r}
+ldsc.p <- read.table("~/Oxford/Results/multiome/ldsc/Plaque/CAD_plaqueMP.Nov2023.results", header = T) %>% 
+  mutate(Category = gsub(x = Category, pattern = "L2_0", replacement = "")) %>% 
+  filter(Category != "Base") %>% 
+  mutate(RNA_clusters = gsub(x = Category, pattern = "cluster_", replacement = ""))
+
+ldsc.p$subtype <- plyr::revalue(ldsc.p$RNA_clusters, c("0" = "IGSF21+ MΦ",
+                                                              "1" = "S100A8/S100A12+ MΦ",
+                                                              "2" = "Lipid-associated MΦ",
+                                                              "3" = "PLIN2hi/TREM1hi MΦ",
+                                                              "4" = "Damaged cells (excluded)",
+                                                              "5" = "cDC2",
+                                                              "6" = "IFNG-activated MΦ",
+                                                              "7" = "cDC1",
+                                                              "8" = "S100A8/S100A12- MΦ",
+                                                              "9" = "Mature cDC2"))
+
+
+ldsc.cre <- read.table("~/Oxford/Results/multiome/ldsc/Subtype_CRE/CAD_cres.results", header = T) %>% 
+  mutate(Category = gsub(x = Category, pattern = "L2_0", replacement = "")) %>% 
+  filter(Category %in% c("Base","multiome_noncres", "multiome_cres") )
+ldsc.cre <- ldsc.cre[c(1,3,2),]
+ldsc.cre$label <- factor(c("Base","Non-CREs", "All CREs"), levels = c("Base","Non-CREs", "All CREs"))
+
+ps6.b.l <- ggplot(ldsc.cre, aes(x = label, fill = Category, y = Enrichment)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_manual(values = ggsci::pal_futurama()(3)) + 
+  #ylim(c(-20,130))+ 
+  ylab(bquote(Enrichment~(frac(Prop[h^2],Prop[SNPs])))) + 
+  geom_errorbar( aes(ymin=Enrichment-Enrichment_std_error, ymax=Enrichment+Enrichment_std_error),
+                 width=0.2, colour="black")  + 
+  geom_hline(yintercept = 1, linetype="dashed")+
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        axis.title.x = element_blank())
+
+ps6.b.r <- ggplot(ldsc.p, aes(x = RNA_clusters, fill = RNA_clusters, y = Enrichment)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_manual(values = ggsci::pal_d3()(10)) + 
+  ylim(c(-20,150))+ 
+  geom_errorbar( aes(ymin=Enrichment-Enrichment_std_error, ymax=Enrichment+Enrichment_std_error),
+                 width=0.2, colour="black")  + 
+  scale_x_discrete(name = "", 
+                       label = c("0" = expression(paste("IGSF21"^"+", " MΦ")),
+                               "1" = expression(paste("S100A8/S100A12"^"+", " MΦ")),
+                               "2" = expression(paste("Lipid-associated", " MΦ")),
+                               "3" = expression(paste("PLIN2"^"hi","/TREM1"^"hi", " MΦ")),
+                               "5" = expression(paste("cDC2")),
+                               "6" = expression(paste("IFNG-activated MΦ")),
+                               "7" = expression(paste("cDC1")),
+                               "8" = expression(paste("S100A8/S100A12"^"-", " MΦ")),
+                               "9" = expression(paste("Mature cDC2")))
+                     )+
+  geom_hline(yintercept = 1, linetype="dashed")+
+  theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        axis.title = element_blank())
+
+
+```
+
+
+size - Enrichment over nonCREs (Ratio of EnrStat)
+color - P-value significant? (EnrStat over nonCREs)
+fill - Tau* (Conditioned over other subtype scores) 
+

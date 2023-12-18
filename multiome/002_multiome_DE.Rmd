@@ -1,0 +1,154 @@
+---
+title: "Differential gene expression and TF activity analysis"
+output: html_notebook
+---
+
+# Load packages
+```{r}
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(chromVAR)
+library(SummarizedExperiment)
+```
+
+```{r}
+MP_multiome <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP_multiome_Mar7.rds")
+```
+
+
+# Gene expression 
+## Finding marker genes
+```{r}
+DefaultAssay(MP_multiome) <- "RNA"
+Idents(MP_multiome) <- "Joint_clusters"
+MP.marker.genes <- FindAllMarkers(MP_multiome, assay = "RNA", only.pos = TRUE, 
+                                  min.pct = 0.1, logfc.threshold = 0.1,test.use = "LR", latent.vars = "percent.mt") 
+
+MP.marker.genes %>% 
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC) 
+```
+
+## oxLDL vs Buffer
+```{r}
+Idents(MP_multiome) <- "treatment"
+MP.oxldl.genes <- FindAllMarkers(MP_multiome, assay = "RNA", only.pos = TRUE, 
+                                  min.pct = 0.1, logfc.threshold = 0,test.use = "LR", latent.vars = "percent.mt", return.thresh = 1) 
+```
+
+# Motif footprint score
+
+## Compute motif deviation scores using chromVAR
+```{r}
+### convert seurat object to summarizedexperiment object
+ATAC.sce <- as.SingleCellExperiment(MP.integrated, assay = "peaks")
+counts <- SummarizedExperiment::assay(ATAC.sce, "counts")
+
+rowRanges <- rownames(ATAC.sce) %>% StringToGRanges
+
+
+## chromVAR deviation Z-score calculation requires raw counts
+ATAC.se <- SummarizedExperiment(assays = list(counts=counts ), 
+                                rowRanges = rowRanges,
+                                colData = colData(ATAC.sce))
+```
+
+```{r}
+## filter peaks
+ATAC.se <- filterPeaks(ATAC.se, min_fragments_per_peak = 1, non_overlapping = TRUE, ix_return = FALSE)
+```
+
+```{r}
+## add GC bias
+library(BSgenome.Hsapiens.UCSC.hg38)
+ATAC.se <- addGCBias(ATAC.se, genome = BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+## MatchMotif 
+## motif pwms matrix can be found here (https://github.com/buenrostrolab/stimATAC_analyses_code/blob/master/data/cisBP_human_pfms_2021.rds)
+human_pwms_v3 <- readRDS("./cisBP_human_pfms_2021.rds")
+## convert motif names
+if(all(grepl("_",names(human_pwms_v3),fixed = TRUE))){
+  names(human_pwms_v3) <- extractTFNames(names(human_pwms_v3))
+}
+
+library(motifmatchr)
+motif_ix <- matchMotifs(human_pwms_v3, ATAC.se, 
+                        genome = BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+## generate background peaks
+set.seed(1998)
+bg <- getBackgroundPeaks(object = ATAC.se, niterations = 50)
+
+## Compute deviation
+dev <- computeDeviations(object = ATAC.se, annotations = motif_ix,
+                         background_peaks = bg)
+
+```
+
+```{r}
+## save as a Seurat Assay
+MP_multiome[["TF"]] <- CreateAssayObject(counts = assay(dev))
+```
+
+## Visualization
+
+```{r}
+## get the most variable TF
+variability <- computeVariability(dev)
+```
+
+```{r}
+## plot motif deviation scores for most variable TFs
+DefaultAssay(MP_multiome) <- "TF"
+TF_to_plot <- variability %>% 
+  filter(variability >= 2) %>%
+  arrange(-variability) %>% 
+  pull(name) 
+
+FeaturePlot(MP_multiome, reduction = "umap.wnn", features = TF) & scale_color_gradient2(name = "Deviation",
+                        low = '#3361A5', 
+                        mid = "white",  high = '#A31D1D',  
+                        midpoint = 0,  na.value = "grey50",
+                        guide = guide_colorbar(frame.linewidth = 0.5, frame.colour = "black"))
+```
+
+# Correlation between TF expression and TF activity (motif deviation)
+```{r}
+## retain expressed TF only
+TF_names <- intersect(MP_multiome@assays$TF %>% rownames(), MP_multiome@assays$RNA %>% rownames())
+
+Deviation <- GetAssayData(MP_multiome, assay = "TF")[TF_names,]
+Expression <- GetAssayData(MP_multiome, assay = "RNA")[TF_names,]
+
+TF_cor <- data.frame()
+for(i in TF_names){
+  ## calculate the correlation in all cells
+  cor.result <- cor.test(Deviation[i,], Expression[i,], method = "pearson")
+  cor.matrix <- data.frame("TF" = i,
+                           "score" = cor.result$estimate,
+                           "p_val" = cor.result$p.value)
+  TF_cor <- rbind(TF_cor, cor.matrix)
+}
+```
+
+## oxLDL vs buffer
+```{r}
+## mean deviation in population of interest
+Idents(MP_multiome) <- "treatment"
+oxldl_cells <- CellsByIdentities(MP_multiome, idents = "oxldl") %>% unlist
+TF_cor$mean_dev <- mean(Deviation[i,oxldl_cells])
+
+## filter out NA values
+TF_cor <- TF_cor[! is.na(TF_cor$score),]
+
+TF_cor$p_val_adj <- p.adjust(TF_cor$p_val, method = "BH")
+TF_cor$flag <- as.character((TF_cor$p_val_adj < 0.05) * sign(TF_cor$score)) # 0 for non significant correlation, 1 for positive and -1 for negative correlation 
+```
+
