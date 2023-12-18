@@ -1,0 +1,329 @@
+---
+title: "s-LDSC analysis of ex vivo macrophages"
+output: html_notebook
+---
+The cis-regulatory peaks are identified from the correlation between peak accessibility and gene expression. Therefore, like DE tests, the power of these cis-regulatory peaks are also depend on the data variation from a) the heterogeneity of macrophage population; b) response to the ox-LDL stimulation.
+
+Now that we have shown these peaks are enriched of CAD risk variants (and CAD SNP heritability), it would be plausible to further stratify them by underlying biological source, and to investigate the macrophage sub-populations and/or the cluster-specific oxLDL response programs by which genetic variants influence diseases.
+
+# Load Packages
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(Signac)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+```
+
+# Load objects
+```{r}
+## Get the cres
+cres <- readRDS("~/Oxford/Code/R/multiome/003_Downstream_GWAS/linked_peaks_df.rds")
+
+## rdata for multiome macrophages
+MP_multiome <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP_multiome_Mar7.rds")
+
+## Output dir for BED files
+outdir <- "~/Oxford/Results/multiome/ldsc/Subtype_CRE/"
+```
+
+# Construct marker gene programs for each subpopulation
+
+## LR test
+```{r}
+DefaultAssay(MP_multiome) <- "RNA"
+Idents(MP_multiome) <- "Joint_clusters"
+
+# use LR test and report all genes
+markers <- FindAllMarkers(MP_multiome, assay = "RNA", only.pos = FALSE, 
+                          min.pct = 0.1, logfc.threshold = 0, return.thresh = 1, 
+                          test.use = "LR", latent.vars = "percent.mt") 
+```
+
+## Convert test statistics to gene scores
+```{r}
+get_scores <- function(df){
+  ## replace zero p values with the mininal non-zero pval to avoid errors when converting to the log scale
+  min_p <- df %>% 
+  filter(p_val > 0) %>% 
+  pull(p_val) %>% 
+  min
+  
+  df2 <- df %>% 
+           mutate(X = ifelse(p_val>0,-2*log(p_val), -2*log(min_p))) %>% 
+           group_by(group) %>% 
+           mutate(score=(X-min(X))/(max(X)-min(X))) %>%
+           ungroup %>% 
+           select(feature, score, group)
+  
+  return(df2)
+}
+
+markers <- get_scores(markers)
+colnames(markers) <- c("gene", "score", "cluster")
+```
+
+## Annotate genomic regions with gene scores
+
+```{r}
+## Get the cis-regulatory peaks targeting MP marker genes
+MP.marker.cres <- merge(markers, cres %>% select(gene,peak), 
+                         by = "gene", all.x = F) # only keep the genes that have at least one CRE
+
+MP.marker.cres$subtype <- plyr::revalue(MP.marker.cres$cluster, c("0" = "PCSK6-hi MΦ",
+                                                                  "1" = "FUCA1-hi MΦ-1",
+                                                                  "2" = "Cycling MΦ-1",
+                                                                  "3" = "M1-like MΦ",
+                                                                  "4" = "FUCA1"^"hi MΦ-2",
+                                                                  "5" = "FCGR"^"hi MΦ",
+                                                                  "6" = "Lipid-handling MΦ",
+                                                                  "7" = "Cycling MΦ-2",
+                                                                  "8" = "AK5"^"+ MΦ"))
+
+```
+
+## Output for s-LDSC
+```{r}
+for(i in c(0:8)){
+  df <- MP.marker.cres %>% 
+    filter(cluster == i) %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+  df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+  data.table::fwrite(df2, file = paste0(outdir,"cluster_",i,".bed"), sep = "\t", quote = F, col.names = F)
+}
+```
+
+# Construct ox-LDL gene programs 
+## LR test per cluster
+```{r}
+MP_multiome$cluster.treatment <- paste(MP_multiome$Joint_clusters , MP_multiome$treatment, sep="_")
+
+Idents(MP_multiome) <- "cluster.treatment"
+MP.oxldl.genes.all <- list()
+for (i in 0:8){
+  try({
+    ident1 <- paste0(i,"_oxldl")
+    ident2 <- paste0(i,"_buffer")
+    treatment.diffgenes <- FindMarkers(MP_multiome, ident.1 = ident1, ident.2=ident2, min.pct=0.1, logfc.threshold=0, return.thresh = 1, test.use = "LR", latent.vars = "percent.mt")
+    MP.oxldl.genes.all[[i+1]] <- treatment.diffgenes
+})
+}
+
+```
+
+## LR test - pseudo-bulk disease vs control
+```{r}
+Idents(MP_multiome) <- "treatment"
+MP.oxldl.genes.ps <- FindMarkers(MP_multiome, ident.1 = "buffer", ident.2="oxldl", min.pct=0.1, logfc.threshold=0, return.thresh = 1, test.use = "LR", latent.vars = "percent.mt")
+```
+
+## Convert test statistics to gene scores
+```{r}
+## annotate CREs
+MP.oxldl.genes.all <- lapply(MP.oxldl.genes.all, FUN = function(x){
+  min_p <- x %>% 
+    filter(p_val > 0) %>% 
+    pull(p_val) %>% 
+    min
+  
+  ## assign the mininal non-zero pval to genes with pval=0
+  x <- x %>% 
+    mutate(X = ifelse(p_val>0,-2*log(p_val), -2*log(min_p))) %>% 
+    mutate(score=(X-min(X))/(max(X)-min(X))) %>% 
+    select(feature, score)
+  colnames(x) <- c("gene", "score")
+  return(x)
+})
+
+MP.oxldl.cres <- lapply(MP.oxldl.genes.all, FUN = function(x){
+  merge(x, cres %>% select(gene,peak), by = "gene", all.x = F) # only keep genes that have at least one link) 
+})
+names(MP.oxldl.cres) <-paste0("cluster_", 0:8)
+
+
+min_p <- MP.oxldl.genes.ps %>% 
+    filter(p_val > 0) %>% 
+    pull(p_val) %>% 
+    min
+
+MP.oxldl.cres.ps <- MP.oxldl.genes.ps %>% 
+  mutate(X = ifelse(p_val>0,-2*log(p_val), -2*log(min_p))) %>% 
+  mutate(score=(X-min(X))/(max(X)-min(X))) %>% 
+  mutate("gene"=feature) %>% 
+  select(gene, score) %>%
+  merge( cres %>% select(gene,peak), by = "gene", all.x = F) 
+
+
+```
+
+## Output for s-LDSC
+
+```{r}
+for(i in paste0("cluster_", c(0:3,5:8))){
+  df <- MP.oxldl.cres[[i]] %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+  df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+  data.table::fwrite(df2, file = paste0(outdir,"OvsB_",i,".bed"), sep = "\t", quote = F, col.names = F)
+}
+
+
+df <- MP.oxldl.cres.ps %>% 
+    group_by(peak) %>% 
+    summarise(score = sum(score))
+df2 <- stringr::str_split_fixed(df$peak, pattern = "-", n=3) %>% 
+    cbind(df %>% select(score) )
+data.table::fwrite(df2, file = paste0(outdir,"OvsB_pseudobulk.bed"), sep = "\t", quote = F, col.names = F)
+```
+
+# Post-processing of s-LDSC results
+## Compute Enrichment scores and Tau*
+### subpopulation programs
+```{r}
+Mref = 6482770 # the total number of variants included in the analysis
+h2g_CAD = 0.0543 # total observed scale SNP h2 
+cov_mat = readRDS("~/Oxford/Results/multiome/ldsc/Subtype_CRE/var_matrix.rds") # co-variance matrix of annotation files for standardization of tau
+ldsc.results <- read.table(paste0(outdir, "CAD_subpopulation.Nov2023.results"), header = T)  %>% 
+  filter(Category!="BaseL2_0")
+
+## Calculate enrichment scores
+enr_background <- read.table("~/Oxford/Results/multiome/ldsc/Subtype_CRE/CAD_cres.results", header = T) %>%
+  filter(Category=="multiome_allpeaksL2_0") %>%
+  mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs))) %>%
+  pull(EnrStat)
+
+df_sub <- ldsc.results %>% 
+  mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs)),
+         EnrStat.z = -qnorm(Enrichment_p/2)) %>% 
+  mutate(EnrStat.se = EnrStat/EnrStat.z) %>% 
+  mutate(Enr.score = EnrStat/enr_background)
+
+
+## Calculate tau star
+sd_sub <- diag(cov_mat) %>% sqrt()
+coef_sub = sd_sub*Mref/h2g_CAD
+
+
+df_sub$Taus <- df_sub$Coefficient * coef_sub
+df_sub$Taus.se <- df_sub$Coefficient_std_error * coef_sub
+df_sub$Taus.p <- dnorm(df_sub$Coefficient_z.score)/2
+
+df_sub$Cluster <- gsub(pattern = "cluster_([0-9])L2_0", replacement = "\\1", x=df_sub$Category)
+df_sub$subtype <- plyr::revalue(df_sub$Cluster,c("0" = "PCSK6-hi MΦ",
+                                                                  "1" = "FUCA1-hi MΦ-1",
+                                                                  "2" = "Cycling MΦ-1",
+                                                                  "3" = "M1-like MΦ",
+                                                                  "4" = "FUCA1"^"hi MΦ-2",
+                                                                  "5" = "FCGR"^"hi MΦ",
+                                                                  "6" = "Lipid-handling MΦ",
+                                                                  "7" = "Cycling MΦ-2",
+                                                                  "8" = "AK5"^"+ MΦ"))
+  
+  
+df_sub$subtype <- factor(df_sub$subtype, levels = df_sub$subtype)
+df_sub$id <- 1:nrow(df_sub)
+
+write.csv(df_sub, paste0(outdir, "ldsc_subpopulations.csv"))
+```
+### ox-LDL programs
+as each subpopulation-ox-ldl program was conditioned on the pseudo-bulk ox-ldl program, there would be one s-LDSC result file per subpopulation, containing heritability estimates for the base, pseudo-bulk program and subpopulation-specific program.
+```{r}
+cov_mat = readRDS("~/Oxford/Results/multiome/ldsc/Subtype_CRE/var_matrix_ox.rds") # co-variance matrix of annotation files for standardization of tau
+
+ldsc.results <- list.files(outdir, pattern = "_oxldl.results$", full.names = T) %>% 
+  lapply(FUN=read.table, header=T) %>% 
+  lapply(FUN = function(df){
+   df %>% mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs)),
+             EnrStat.z = qnorm(1-Enrichment_p/2)) %>% 
+      mutate(EnrStat.se = EnrStat/EnrStat.z) %>% 
+      select(Category,EnrStat,EnrStat.z,EnrStat.se, Coefficient, Coefficient_std_error, Coefficient_z.score)
+  })
+names(enr_res_ox) <- paste0("oxldl_cl_",0:8)
+
+## Calculate taustar
+sd_ox <- diag(cov_mat) %>% sqrt()
+coef_ox = sd_ox*Mref/h2g_CAD
+
+taus_ox <- (lapply(enr_res_ox, FUN=function(df){return(df$Coefficient[1])}) %>% unlist) * coef_ox[2:10]
+taus_se_ox <- (lapply(enr_res_ox, FUN=function(df){return(df$Coefficient_std_error[1])}) %>% unlist) * coef_ox[2:10]
+taus_p_ox <- lapply(enr_res_ox,FUN=function(df){dnorm(df$Coefficient_z.score[1])/2}) %>% unlist
+
+# plot
+df_ox <- data.frame(Cluster = as.factor(0:8),
+                     Enr.score = enr_res_ox %>% 
+                       lapply(FUN = function(df){
+                         df$EnrStat[1]/df$EnrStat[2] ## subpopulation-specific program vs pseudo-bulk program
+                       }) %>% unlist,
+                     Enr.p = enr_res_ox %>% 
+                       lapply(FUN = function(df){
+                         dnorm((df$EnrStat %>% diff)/sqrt(sum(df$EnrStat.se^2)))/2
+                         }) %>% unlist,
+                     Taus = taus_ox,
+                     Taus_se = taus_se_ox,
+                     Taus.p = taus_p_ox)
+
+write.csv(df_ox, paste0(outdir, "ldsc_subpopulations_oxldl.csv"))
+```
+
+## Visualization 
+```{r}
+df_sub <- read.csv(file = paste0(outdir, "ldsc_subpopulations.csv"))
+## plot
+n_cluster <- nrow(df_sub)
+p3.d <- df_sub %>% 
+  mutate(flag = ifelse(Taus.p <= 0.1, ifelse(Taus.p <=0.05, "1", "2"), "3")) %>% 
+  ggplot(aes(x=Cluster, y=rep(1,n_cluster), size = Enr.score)) +
+    geom_point(aes(color = Taus),alpha=1, stroke = 1) +
+    scale_color_gradient2(limits = c(-3,3), low = '#3361A5', high =  '#A31D1D', 
+                        mid = 'grey98', midpoint=0, breaks=c(-2,0,2),name = bquote("Effect"~"sizes"~tau*"*")) + 
+    scale_y_continuous(limits=c(0.5,1.5),breaks = 1, position = "left", labels = "Subpopulation\n programs") +
+    scale_size_continuous(limits = c(0.6, 5), breaks = c(1,3,5), name = "Enrichment over background") +
+    ggforce::geom_circle(aes(x0=as.numeric(Cluster), y0=1, r=0.2, linetype = flag), color='black', size=0.75, inherit.aes=F) + 
+    scale_linetype_manual(values = c("1" = "solid", "2" = "dotted", "3"="blank"),name = "Significance", labels=c("1"="p<0.05","2"="p<0.1","3"="") ) + 
+    coord_fixed() +
+    guides(size = guide_legend(override.aes = list(fill="black"), title.position="top"),
+           color = guide_colorbar(frame.colour = "black", ticks.colour = "black", frame.linewidth = 1, nrow=1, title.position="top"),
+           linetype = guide_legend(title.position="top")) +
+    theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) +
+    theme(axis.line=element_blank(),
+      axis.text.x=element_blank(),
+      axis.title.x=element_blank(),
+      axis.title.y=element_blank(),
+      legend.position="top",
+      panel.grid.minor=element_blank(),
+      plot.background=element_blank())
+```
+
+```{r}
+df_ox <- read.csv(file = paste0(outdir, "ldsc_subpopulations_oxldl.csv"))
+
+n_cluster <- nrow(df_ox)
+
+p3.e <- df_ox %>% 
+  mutate(flag = ifelse(Taus.p <= 0.1, ifelse(Taus.p <=0.05, "1", "2"), "3")) %>% 
+  ggplot(aes(x=Cluster, y=rep(1,n_cluster), size = Enr.score)) +
+    geom_point(aes(color = Taus),alpha=1, stroke = 1) +
+    scale_color_gradient2(limits = c(-3,3), low = '#3361A5', high =  '#A31D1D', 
+                        mid = 'grey98', midpoint=0, breaks=c(-2,0,2),name = bquote("Effect"~"sizes"~tau*"*")) + 
+    scale_y_continuous(limits=c(0.5,1.5),breaks = 1, position = "left", labels = "Subpopulation-\n oxLDL programs") +
+    scale_size_continuous(limits = c(0.6, 5), breaks = c(1,3,5), name = "Enrichment over background") +
+    ggforce::geom_circle(aes(x0=as.numeric(Cluster), y0=1, r=0.2, linetype = flag), color='black', size=0.75, inherit.aes=F) + 
+    scale_linetype_manual(values = c("1" = "solid", "2" = "dotted", "3"="blank"),name = "Significance", labels=c("1"="p<0.05","2"="p<0.1","3"="") ) +
+    coord_fixed() +
+    guides(size = guide_legend(override.aes = list(fill="black"), title.position="top"),
+           color = guide_colorbar(frame.colour = "black", ticks.colour = "black", frame.linewidth = 1, nrow=1, title.position="top"),
+           linetype = guide_legend(title.position="top")) +
+    theme_bw(base_size = 15,base_rect_size = 2, base_line_size = 0.2) +
+    theme(axis.line=element_blank(),
+     axis.text.x = element_text(angle = 60, vjust = 1, hjust=1),
+      axis.title.x=element_blank(),
+      axis.title.y=element_blank(),
+      legend.position="top",
+      panel.grid.minor=element_blank(),
+      plot.background=element_blank())
+```
+
