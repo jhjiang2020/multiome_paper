@@ -45,11 +45,11 @@ MP.list <- lapply(MP.list, FUN = function(object){
 MP.list <- lapply(MP.list, SCTransform, assay = "RNA", verbose=F, vars.to.regress = c("CC.Difference", "percent.mt"), variable.features.n = 3000)
 ```
 
-### Default CCA integration with SCTransform
-Integration method tested:
+### Default CCA integration with SCTransform with n=5000 variable genes
+Other integration methods tested:
   CCA - 3k features, reference = c(1:6)
   rPCA - 5k features, reference = c(1:6)
-
+Note to Self: reference = c(1:6) set the first 6 datasets (from Alsaigh et al., Commun. Biol, 2022) as the reference for pair-wise integration, otherwise a error will be rasied from sparseMatrix "unable to coerce from TsparseMatrix to [CR]sparseMatrixwhen length of 'i' slot exceeds 2^31-1"
 ```{r}
 ### select features that are repeatedly variable across datasets for integration
 features <- SelectIntegrationFeatures(object.list = MP.list, nfeatures = 5000)
