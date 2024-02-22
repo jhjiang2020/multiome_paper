@@ -37,7 +37,7 @@ counts <- AggregateExpression(
   return.seurat = FALSE,
   group.by = "orig.ident",
   add.ident = NULL,
-  slot = "data",
+  slot = "count",
   verbose = TRUE
 )
 
