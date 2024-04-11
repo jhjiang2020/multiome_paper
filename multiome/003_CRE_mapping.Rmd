@@ -14,7 +14,7 @@ library(htmltools)
 ```
 
 ```{r}
-MP_multiome <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP_multiome_Mar7.rds")
+MP_multiome <- readRDS("/working_dir/rdata/MP_multiome_Mar7.rds")
 ```
 
 # Load functions 
@@ -214,7 +214,7 @@ DORC_TF_matrix_all <- mp_FigR %>%
   tidyr::pivot_wider(id_cols = DORC, names_from = Motif, values_from = Score, values_fill = 0, values_fn = as.numeric) %>%
   tibble::column_to_rownames(var="DORC") %>% 
   as.matrix
-saveRDS(DORC_TF_matrix_all, "~/Oxford/Results/multiome/rdata/DORC_TF_matrix.rds")
+saveRDS(DORC_TF_matrix_all, "/working_dir/rdata/DORC_TF_matrix.rds")
 ```
 
 ```{r}
@@ -227,7 +227,7 @@ DORC_TF_matrix <- DORC_TF_matrix_all[row_select, col_select]
 
 range <- max(abs(DORC_TF_matrix))
 
-CAD_genes <- read.csv("~/Oxford/Results/multiome/multiome_share/003_CAD_GWAS/archive/CAD_overlapping_links(CREs)_annotated.csv") %>% select(CRE_gene) %>% unique %>% unlist
+CAD_genes <- read.csv("/working_dir/003_CAD_GWAS/archive/CAD_overlapping_links(CREs)_annotated.csv") %>% select(CRE_gene) %>% unique %>% unlist
 
 CAD_annot <- data.frame(CAD = ifelse(rownames(DORC_TF_matrix) %in% CAD_genes, yes = "yes", no = "no"))
 rownames(CAD_annot) <- rownames(DORC_TF_matrix)
@@ -424,13 +424,13 @@ set.seed(1998)
 bg <- chromVAR::getBackgroundPeaks(object = ATAC.se, niterations=1000)
 rownames(bg) <- rownames(ATAC.se)
 
-saveRDS(bg, "~/Oxford/Results/multiome/multiome_share/rdata/bgPeaks.rds")
+saveRDS(bg, "/working_dir/rdata/bgPeaks.rds")
 ```
 
 ## eQTL
 Whole blood eQTL SNPs were downloaded from GTEx v8 and eQTL gene and manually lifted over to hg38
 ```{r}
-eqtl.df <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/annot/eqtl.df.hg38.rds")
+eqtl.df <- readRDS("/working_dir/rdata/annot/eqtl.df.hg38.rds")
 
 results.eqtl <- GWASPeakZtest(peakSet = cres$peak %>% unique(),
               bgPeaks = bg, SNPSet = eqtl.df$Pos_hg38 %>% unique() %>% StringToGRanges(), n_bgs = 500, return_bg = T)
@@ -441,7 +441,7 @@ plot_enrichment(results.eqtl, binwidth = 80)
 ## ABC-enhancer
 ABC-enhancers from 38 mononuclear phagocytes samples were retrieved from [https://www.engreitzlab.org/resources] and lifted over to hg38
 ```{r}
-ABC_links_mono.gr <- readRDS("~/Oxford/Results/multiome/rdata/ABC_links_mono.rds")
+ABC_links_mono.gr <- readRDS("/working_dir/rdata/ABC_links_mono.rds")
 
 results.abc <- MarkPeakZtest(peakSet = cres$peak %>% unique(),
               bgPeaks = bg,  MarkSet = ABC_links_mono.gr %>% reduce(), n_bgs = 500, return_bg =T)
@@ -451,8 +451,8 @@ plot_enrichment(results.abc, binwidth = 30)
 
 ## Promoter interacting elements (PCHi-C) PMID: 27863249
 ```{r}
-ch <- "../../hg19ToHg38.over.chain"
-phic.gr.hg38<- read.table("~/Oxford/Results/multiome/TAD_definitions/PCHiC_peak_matrix_cutoff5.tsv", header = T) %>% 
+ch <- import.chain("../../hg19ToHg38.over.chain")
+phic.gr.hg38<- read.table("/path_to_data/PCHiC_peak_matrix_cutoff5.tsv", header = T) %>% 
   filter(oeName != ".") %>%
   filter(max(Mac0, Mac1, Mac2) >= 5) %>%
   select(oeChr, oeStart, oeEnd, baitName) %>% 
