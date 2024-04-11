@@ -99,8 +99,8 @@ DimPlot(MP_Plaque, reduction = "umap.rna", group.by = c("study_id","batch"))
 
 ### Wilcoxon test
 ```{r}
-Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
-source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+Rcpp::sourceCpp("../../functions/fast_wilcox.cpp")
+source("../../functions/Fast_Wilcoxon.R")
 
 DefaultAssay(MP_Plaque) <- "RNA"
 markers <- wilcoxauc(MP_Plaque, group_by = "RNA_clusters")
@@ -148,7 +148,7 @@ saveRDS(MP_Plaque, paste0(data_dir, "MP_Plaque.Nov2023.rds"))
 MP_Plaque <- readRDS(paste0(data_dir, "MP_Plaque.Nov2023.rds")) %>% 
   subset(RNA_clusters!="4")
 
-MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+MP_oxldl <- readRDS(paste0(data_dir,"/scRNA/MP.Nov2023.rds")) %>% 
   subset(RNA_clusters %in% c(0:5,8))
 ```
 
@@ -203,7 +203,7 @@ DimPlot(MP_oxldl, reduction = "umap", group.by = "predicted.Plaque_clusters", la
   ggtitle("Transferred labels")
 ```
 ```{r}
-saveRDS(MP_oxldl, "~/Oxford/Results/scRNA/MP_scRNA_filtered.Nov2023.rds")
+saveRDS(MP_oxldl, paste0(data_dir,"/scRNA/MP_scRNA_filtered.Nov2023.rds"))
 ```
 ## Evaluation (CCA)
 ```{r}
@@ -268,13 +268,13 @@ import scanpy as sc
 adata = sc.AnnData(X = r.exprs.T, obs = r.meta, var = r.feature_meta)
 adata.obsm['umap'] = r.embedding
 
-adata.write("/Users/jhjiang/Oxford/Results/multiome/scVI/data/MP_Plaque.Nov2023.h5ad", compression="gzip")
+adata.write("/working_dir/scVI/data/MP_Plaque.Nov2023.h5ad", compression="gzip")
 ```
 
 
 ## Ex vivo macrophages - query dataset
 ```{r}
-MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+MP_oxldl <- readRDS(paste0(data_dir,"/scRNA/MP.Nov2023.rds")) %>% 
   subset(RNA_clusters %in% c(0:5,8))
 DefaultAssay(MP_oxldl) <- "RNA"
 exprs <- GetAssayData(MP_oxldl, slot = "counts")
@@ -288,11 +288,11 @@ import scanpy as sc
 adata = sc.AnnData(X = r.exprs.T, obs = r.meta, var = r.feature_meta)
 adata.obsm['umap'] = r.embedding
 
-adata.write("/Users/jhjiang/Oxford/Results/multiome/scVI/data/MP_oxldl.Nov2023.h5ad", compression="gzip")
+adata.write("/working_dir/scVI/data/MP_oxldl.Nov2023.h5ad", compression="gzip")
 ```
 ## Evaluation (scANVI)
 ```{r}
-df_pred <- read.csv("~/Oxford/Results/multiome/scVI/results/MP_oxldl.Nov2023.pred.csv", row.names = 1)
+df_pred <- read.csv(paste0(data_dir,"/scVI/results/MP_oxldl.Nov2023.pred.csv"), row.names = 1)
 colnames(df_pred) <- c(0:3,5:9)
 ```
 
@@ -310,7 +310,7 @@ cells <- rownames(MP_oxldl@meta.data)
 MP_oxldl$scANVI_pred <- df[cells,"variable"]
 ```
 ```{r}
-saveRDS(MP_oxldl, "~/Oxford/Results/scRNA/MP_scRNA_filtered.Nov2023.rds")
+saveRDS(MP_oxldl, paste0(data_dir,"scRNA/MP_scRNA_filtered.Nov2023.rds"))
 ```
 
 
@@ -355,7 +355,7 @@ p.scanvi
 MP_Plaque <- readRDS(paste0(data_dir, "MP_Plaque.Nov2023.rds")) %>%
   subset( subtype != "Damaged cells (excluded)")
 
-MP_oxldl <- readRDS("~/Oxford/Results/scRNA/MP.Nov2023.rds") %>% 
+MP_oxldl <- readRDS(paste0(data_dir,"/scRNA/MP.Nov2023.rds")) %>% 
   subset(RNA_clusters %in% c(0:5,8))
 
 ## aggregate the counts (log1p normalized)
