@@ -117,12 +117,12 @@ LAM$RNA_clusters <- LAM$seurat_clusters
 DimPlot(LAM, reduction = "umap.lam", group.by = "RNA_clusters", label = T, repel = T) 
 ```
 ```{r}
-saveRDS(LAM, file = "~/Oxford/Results/multiome/multiome_share/005_meta_analysis/rdata/LAM_plaque.Nov2023.rds")
+saveRDS(LAM, file = paste0(data_dir, "/rdata/LAM_plaque.Nov2023.rds"))
 ```
 
 ```{r}
-Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
-source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+Rcpp::sourceCpp("../../functions/fast_wilcox.cpp")
+source("../../functions/Fast_Wilcoxon.R")
 DefaultAssay(LAM) <- "RNA"
 markers <- wilcoxauc(LAM, group_by = "seurat_clusters")
 ```

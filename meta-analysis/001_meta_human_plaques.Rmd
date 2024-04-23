@@ -234,8 +234,8 @@ pred.human_plaques
 
 ### Wiloxon test to find marker genes
 ```{r}
-Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
-source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+Rcpp::sourceCpp("../../functions/fast_wilcox.cpp")
+source("../../functions/Fast_Wilcoxon.R")
 
 markers <- wilcoxauc(Human_Plaque, group_by = "RNA_clusters")
 ```

@@ -21,7 +21,7 @@ bcftools="bcftools"
 plink = "plink"
 
 # load gwas catalog
-gwas.hg38 <- format_GWAS_SNP("/well/ocallaghan/users/qhs307/raw_data/GWAS_catalog/gwasCatalog.txt.gz", p_value_threshold = 5e-8)
+gwas.hg38 <- format_GWAS_SNP("/working_dir/raw_data/GWAS_catalog/gwasCatalog.txt.gz", p_value_threshold = 5e-8)
 
 ## Manual filtering
 gwas.hg38.cad <- filter_GWAS_SNP(formatted.gwas = gwas.hg38, filter = "Coronary artery disease")
@@ -31,7 +31,7 @@ gwas.hg38.cad <- filter_GWAS_SNP(formatted.gwas = gwas.hg38, filter = "Coronary 
 colnames(gwas.hg38.cad) <- c("rsid", "SNP", "P", "trait")
 
 ## Prune SNPs to get independent loci (r2<0.1)
-genotypeData = "/well/ocallaghan/users/qhs307/reference_genome/hg38_1000G/EUR/EUR_posid_hg38"
+genotypeData = "/working_dir/reference_genome/hg38_1000G/EUR/EUR_posid_hg38"
 gwas.hg38.pruned <- prune_GWAS_SNP(gwas.hg38.cad, plink = plink, genotypeData = genotypeData, r2=0.1)
 
 ## get highLD SNPs within each locus (r2>0.8 with the index SNP)
@@ -40,7 +40,7 @@ gwas.hg38.finalist <- getld_GWAS_SNP(gwas.hg38.pruned, plink = plink, genotypeDa
 
 
 ## Get rsids with bcftools query
-vcf = "/well/ocallaghan/users/qhs307/raw_data/dbSNP/dbSNP.common.hg38.vcf.gz"
+vcf = "/working_dir/raw_data/dbSNP/dbSNP.common.hg38.vcf.gz"
 
 
 gwas.hg38.finalist <- pos2rsid(gwas.hg38.finalist, bcftools=bcftools, vcf=vcf)
@@ -52,17 +52,17 @@ saveRDS(gwas.hg38.finalist, "./CAD_associated_SNPs.hg38.rds")
 ## Permutation-based enrichment test 
 ```{r}
 ## Load background peakset
-bg <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/bgPeaks.rds")
+bg <- readRDS("/working_dir/rdata/bgPeaks.rds")
 ```
 
 ### CREs and ox-LDL CREs
 ```{r}
 # load CREs
 # cres <- Links(MP_multiome)
-cres <- readRDS("~/Oxford/Code/R/multiome/003_Downstream_GWAS/linked_peaks_df.rds")
+cres <- readRDS("/working_dir/cres_df.rds")
 
 # we define oxLDL-induced genes as the union of ox-LDL-induced DEGs in each cluster
-oxLDL_induced.genes <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP.DE.genes.all_nov9.rds") %>% 
+oxLDL_induced.genes <- readRDS("/working_dir/rdata/MP.DE.genes.all_nov9.rds") %>% 
   lapply(FUN = filter, p_val_adj < 0.05) %>% 
   lapply(FUN = tibble::rownames_to_column, var = "gene" ) %>%
   bind_rows %>% 
@@ -90,7 +90,7 @@ saveRDS(list("ALL" = enr.cres,
 
 ### ABC-enhancers
 ```{r}
-ABC_links_mono.gr <- readRDS( "~/Oxford/Results/multiome/rdata/ABC_links_mono.rds")
+ABC_links_mono.gr <- readRDS( "/working_dir/rdata/ABC_links_mono.rds")
 
 ## get the ABC_enhancer-overlapping peaks and their targeting genes
 All_peaks <- rownames(bg) %>% StringToGRanges()

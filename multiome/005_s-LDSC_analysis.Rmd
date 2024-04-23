@@ -19,13 +19,13 @@ library(patchwork)
 # Load objects
 ```{r}
 ## Get the cres
-cres <- readRDS("~/Oxford/Code/R/multiome/003_Downstream_GWAS/linked_peaks_df.rds")
+cres <- readRDS("/working_dir/cres_df.rds")
 
 ## rdata for multiome macrophages
-MP_multiome <- readRDS("~/Oxford/Results/multiome/multiome_share/rdata/MP_multiome_Mar7.rds")
+MP_multiome <- readRDS("/working_dir/rdata/MP_multiome_Mar7.rds")
 
 ## Output dir for BED files
-outdir <- "~/Oxford/Results/multiome/ldsc/Subtype_CRE/"
+outdir <- "/working_dir/ldsc/Subtype_CRE/"
 ```
 
 # Construct marker gene programs for each subpopulation
@@ -186,12 +186,12 @@ data.table::fwrite(df2, file = paste0(outdir,"OvsB_pseudobulk.bed"), sep = "\t",
 ```{r}
 Mref = 6482770 # the total number of variants included in the analysis
 h2g_CAD = 0.0543 # total observed scale SNP h2 
-cov_mat = readRDS("~/Oxford/Results/multiome/ldsc/Subtype_CRE/var_matrix.rds") # co-variance matrix of annotation files for standardization of tau
+cov_mat = readRDS("/working_dir/ldsc/Subtype_CRE/var_matrix.rds") # co-variance matrix of annotation files for standardization of tau
 ldsc.results <- read.table(paste0(outdir, "CAD_subpopulation.Nov2023.results"), header = T)  %>% 
   filter(Category!="BaseL2_0")
 
 ## Calculate enrichment scores
-enr_background <- read.table("~/Oxford/Results/multiome/ldsc/Subtype_CRE/CAD_cres.results", header = T) %>%
+enr_background <- read.table("/working_dir/ldsc/Subtype_CRE/CAD_cres.results", header = T) %>%
   filter(Category=="multiome_allpeaksL2_0") %>%
   mutate(EnrStat = (h2g_CAD/Mref)*((Prop._h2/Prop._SNPs)-(1-Prop._h2)/(1-Prop._SNPs))) %>%
   pull(EnrStat)
@@ -232,7 +232,7 @@ write.csv(df_sub, paste0(outdir, "ldsc_subpopulations.csv"))
 ### ox-LDL programs
 as each subpopulation-ox-ldl program was conditioned on the pseudo-bulk ox-ldl program, there would be one s-LDSC result file per subpopulation, containing heritability estimates for the base, pseudo-bulk program and subpopulation-specific program.
 ```{r}
-cov_mat = readRDS("~/Oxford/Results/multiome/ldsc/Subtype_CRE/var_matrix_ox.rds") # co-variance matrix of annotation files for standardization of tau
+cov_mat = readRDS("/working_dir/ldsc/Subtype_CRE/var_matrix_ox.rds") # co-variance matrix of annotation files for standardization of tau
 
 ldsc.results <- list.files(outdir, pattern = "_oxldl.results$", full.names = T) %>% 
   lapply(FUN=read.table, header=T) %>% 

@@ -171,8 +171,8 @@ p1 + p2
 
 ### Wilcoxon test
 ```{r}
-Rcpp::sourceCpp("~/Oxford/Code/R/functions/fast_wilcox.cpp")
-source("~/Oxford/Code/R/functions/Fast_Wilcoxon.R")
+Rcpp::sourceCpp("../../functions/fast_wilcox.cpp")
+source("../../functions/Fast_Wilcoxon.R")
 
 
 DefaultAssay(MP) <- "RNA"
