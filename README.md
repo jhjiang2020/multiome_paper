@@ -1,11 +1,10 @@
-# Scripts for computational analyses of scRNA-seq and single-cell multiome data presented in "Partitioning heritability using single-cell multi-omics identifies a novel macrophage subpopulation conveying genetic risks of coronary artery disease"
+# Scripts for computational analyses of scRNA-seq and single-cell multiome data presented in "A Novel Macrophage Subpopulation Conveys Increased Genetic Risk of Coronary Artery Disease"
 
 ## Description
 
 This repository contains the scripts to reproduce results and figures for the multiome paper:
 
-Jiang J, Hiron T.K., et al. "Partitioning heritability using single-cell multi-omics identifies a novel macrophage subpopulation conveying genetic risks of coronary artery disease." bioRxiv (2023): 2023-09.
-https://www.biorxiv.org/content/10.1101/2023.09.14.557845v1
+Jiang J, Hiron TK, et al. [A Novel Macrophage Subpopulation Conveys Increased Genetic Risk of Coronary Artery Disease.](https://www.ahajournals.org/doi/10.1161/CIRCRESAHA.123.324172) Circ Res. 2024 Jun 21;135(1):6-25. Epub 2024 May 15. PMID: 38747151; PMCID: PMC11191562.
 
 ## Table of Contents
 
@@ -25,7 +24,7 @@ Here is a breakdown of all scripts in this repository by dataset and analysis:
 3. The `meta-analysis` folder contains scripts for sample integration and clusterings at three different levels (all cells(meta-analysis/001_meta_human_plaques.Rmd), macrophages(meta-analysis/002_meta_macrophages.Rmd) and LAMs(meta-analysis/004_cluster_stability_LAM.Rmd)). We also include Python scripts for the deep-learning-based macrophage classification(meta-analysis/003_scVI_labeltransfer.ipynb).
 
 **A special note for running s-LDSC analysis:**
-We performed our s-LDSC analysis as instructed in the [ldsc wiki](https://github.com/bulik/ldsc/wiki), using the reference 1000G phase 3 genome (EUR) in hg38 obtained from [PLINK resource page](https://www.cog-genomics.org/plink/2.0/resources). The script we used for running s-LDSC was not included in this repository as it was specifically designed for our high-performance biomedical computing cluster. The LDSC code we executed is outlined below:
+We performed our s-LDSC analysis as instructed in the [ldsc wiki](https://github.com/bulik/ldsc/wiki), using the reference 1000G phase 3 genome (EUR) in hg38 obtained from [PLINK resource page](https://www.cog-genomics.org/plink/2.0/resources). It's important to note that the original `make_annot.py` script is incompatible with continuous annotations. Therefore, we [modified](https://github.com/jhjiang2020/ldsc/blob/master/make_annot.py) it to accommodate a continuous scale instead of a binary score. The script we used for running s-LDSC was not included in this repository as it was specifically designed for our high-performance biomedical computing cluster. The LDSC code we executed is outlined below:
 ```bash
 conda activate ldsc-env
 
